@@ -24,53 +24,16 @@ import GHC.IO (evaluate)
 
 data Impl
 
--- | The root event
-{-# NOINLINE _root #-}
-_root :: (Event Impl (), IO ())
-_root@(rootTickE, propagateRoot) = unsafePerformIO $ do
-  subscribersRef <- newIORef mempty
-  ctrRef <- newIORef 0
-  occRef <- newIORef Nothing
-  pure ( Event $ \sub -> do
-           thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
-           modifyIORef subscribersRef $ IntMap.insert thisSubId sub
-           (modifyIORef subscribersRef (IntMap.delete thisSubId),) <$> readIORef occRef
-       , do writeAndScheduleClear occRef (Just ())
-            mapM_ (`subscriberPropagate` Just ()) =<< readIORef subscribersRef
-       )
-
-type MakeEventTrigger a = (a -> EventTrigger)
-type EventTrigger = IO ()
-
-newEvent :: IO (MakeEventTrigger a, Event Impl a)
-newEvent = do
-  occRef <- newIORef Nothing -- Root event (non-)occurrence is always "known", thus Maybe a
-  let e = Event $ subscribeWith rootTickE (\_ -> const (readIORef occRef))
-  pure (writeAndScheduleClear occRef, e)
-
-subscribeEvent :: forall a. Event Impl a -> IO (IORef (Maybe a))
-subscribeEvent e = do
-  occRef :: IORef (Maybe a) <- newIORef Nothing
-  _ <- subscribeWith e (\_ occ -> mapM_ (writeAndScheduleClear occRef) occ >> pure Nothing) $ Subscriber $ const (pure ())
-  pure occRef
-
 newtype Subscriber a = Subscriber { subscriberPropagate :: Maybe a -> IO () }
 type Unsubscribe = IO ()
-
--- TODO: MaybeT IO (Maybe b)?
-subscribeWith :: Event Impl a -> (Unsubscribe -> Maybe a -> IO (Maybe b)) -> Subscriber b -> IO (Unsubscribe, Maybe (Maybe b))
-subscribeWith e f subscriber = mdo
-  (unsubscribe, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate subscriber <=< (unsubscribe `f`)
-  fmap (unsubscribe,) .  mapM (unsubscribe `f`) $ occ
-
 type Invalidator = IORef (Maybe (IO ()))
 
 instance Frp Impl where
-  type Moment Impl = IO
-  newtype Behavior Impl a = Behavior (ReaderT Invalidator IO a)
-    deriving (Functor, Applicative, Monad, MonadFix)
   newtype Event Impl a = Event
     { subscribeAndRead :: Subscriber a -> IO (Unsubscribe, Maybe (Maybe a)) }
+  newtype Behavior Impl a = Behavior (ReaderT Invalidator IO a)
+    deriving (Functor, Applicative, Monad, MonadFix)
+  type Moment Impl = IO
 
   never :: Event Impl a
   never = undefined <$ FRP.filterE (const False) rootTickE
@@ -146,6 +109,43 @@ instance MonadMoment Impl IO where
     res <- unsafeInterleaveIO . runReaderT b =<< newIORef Nothing
     addToQueue behaviorInitsRef $ void . evaluate $ res
     pure res
+
+-- | The root event
+{-# NOINLINE _root #-}
+_root :: (Event Impl (), IO ())
+_root@(rootTickE, propagateRoot) = unsafePerformIO $ do
+  subscribersRef <- newIORef mempty
+  ctrRef <- newIORef 0
+  occRef <- newIORef Nothing
+  pure ( Event $ \sub -> do
+           thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
+           modifyIORef subscribersRef $ IntMap.insert thisSubId sub
+           (modifyIORef subscribersRef (IntMap.delete thisSubId),) <$> readIORef occRef
+       , do writeAndScheduleClear occRef (Just ())
+            mapM_ (`subscriberPropagate` Just ()) =<< readIORef subscribersRef
+       )
+
+type MakeEventTrigger a = (a -> EventTrigger)
+type EventTrigger = IO ()
+
+newEvent :: IO (MakeEventTrigger a, Event Impl a)
+newEvent = do
+  occRef <- newIORef Nothing -- Root event (non-)occurrence is always "known", thus Maybe a
+  let e = Event $ subscribeWith rootTickE (\_ -> const (readIORef occRef))
+  pure (writeAndScheduleClear occRef, e)
+
+subscribeEvent :: forall a. Event Impl a -> IO (IORef (Maybe a))
+subscribeEvent e = do
+  occRef :: IORef (Maybe a) <- newIORef Nothing
+  _ <- subscribeWith e (\_ occ -> mapM_ (writeAndScheduleClear occRef) occ >> pure Nothing) $ Subscriber $ const (pure ())
+  pure occRef
+
+
+-- TODO: MaybeT IO (Maybe b)?
+subscribeWith :: Event Impl a -> (Unsubscribe -> Maybe a -> IO (Maybe b)) -> Subscriber b -> IO (Unsubscribe, Maybe (Maybe b))
+subscribeWith e f subscriber = mdo
+  ~(unsubscribe, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate subscriber <=< f unsubscribe
+  fmap (unsubscribe,) .  mapM (f unsubscribe) $ occ
 
 runFrame :: [EventTrigger] -> IO a -> IO a
 runFrame triggers program = do
