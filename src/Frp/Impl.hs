@@ -84,17 +84,17 @@ instance Frp Impl where
       (unsubscribeInnerE, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate sub
       pure (writeIORef maybeInvalidator Nothing >> unsubscribeInnerE, occ)
 
+data BehaviorAssignment where
+  BehaviorAssignment :: IORef a -> a -> IORef [Invalidator] -> BehaviorAssignment
+
 instance MonadMoment Impl IO where
   hold :: a -> Event Impl a -> Moment Impl (Behavior Impl a)
   hold v0 e = do
     invsRef <- newIORef []
     valRef <- newIORef v0
-    -- Make sure to touch 'e' eagerly, instead wait for Behavior init time.
+    -- Make sure not to touch 'e' eagerly, instead wait for Behavior init time.
     addToQueue behaviorInitsRef $ void $ subscribeWith
-      (mapM (\a -> addToQueue behaviorAssignmentsRef $ do
-               writeIORef valRef a
-               atomicModifyIORef invsRef ([],) >>=
-                 mapM_ (\invRef -> readIORef invRef >>= mapM_ (\i -> writeIORef invRef Nothing >> i))))
+      (mapM (\a -> addToQueue behaviorAssignmentsRef $ BehaviorAssignment valRef a invsRef))
       e
       . Subscriber $ const (pure ())
     pure $ Behavior $ ReaderT $ \invalidator -> do
@@ -164,7 +164,11 @@ runFrame triggers program = do
       sequence_ inits
       runHoldInits
   atomicModifyIORef toClearQueueRef ([],) >>= mapM_ (\(Some (Compose occRef)) -> writeIORef occRef Nothing)
-  atomicModifyIORef behaviorAssignmentsRef ([],) >>= sequence_
+  atomicModifyIORef behaviorAssignmentsRef ([],)
+    >>= mapM_ (\(BehaviorAssignment valRef a invsRef) -> do
+                  writeIORef valRef a
+                  atomicModifyIORef invsRef ([],) >>=
+                    mapM_ (\invRef -> readIORef invRef >>= mapM_ (\i -> writeIORef invRef Nothing >> i)))
   pure res
 
 cacheEvent :: forall a. Event Impl a -> Event Impl a
@@ -194,7 +198,7 @@ toClearQueueRef :: IORef [Some (Compose IORef Maybe)]
 toClearQueueRef = unsafePerformIO $ newIORef []
 
 {-# NOINLINE behaviorAssignmentsRef #-}
-behaviorAssignmentsRef :: IORef [IO ()]
+behaviorAssignmentsRef :: IORef [BehaviorAssignment]
 behaviorAssignmentsRef = unsafePerformIO $ newIORef []
 
 {-# NOINLINE behaviorInitsRef #-}
