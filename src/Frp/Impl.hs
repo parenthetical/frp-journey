@@ -39,19 +39,16 @@ instance Frp Impl where
   never = undefined <$ FRP.filterE (const False) rootTickE
 
   mapMaybeMoment :: (a -> Moment Impl (Maybe b)) -> Event Impl a -> Event Impl b
-  mapMaybeMoment f = Event . (`subscribeWith` (\_ -> fmap join . mapM f))
+  mapMaybeMoment f = Event .  subscribeWith (fmap join . mapM f)
 
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
   coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
-    let f = fmap join
+    let f = fmap join -- TODO: awkward
           . mapM (maybe
                   (pure (Just Nothing))
-                  (\innerE -> mdo
-                      fmap snd .
-                        subscribeWith innerE (\unsubscribeInner occ -> do
-                                                 unsubscribeInner
-                                                 pure occ)
-                        $ Subscriber $ subscriberPropagate sub))
+                  (\innerE -> fmap snd . subscribeWith'
+                     (\unsubscribeInner occ -> unsubscribeInner >> pure occ) innerE
+                     . Subscriber $ subscriberPropagate sub))
     (unsubscribeOuter, occOuter) <-
       subscribeAndRead coincidenceParent $ Subscriber $ mapM_ (subscriberPropagate sub) <=< f . Just
     occ <- f occOuter
@@ -69,8 +66,8 @@ instance Frp Impl where
     let doSub :: forall c. Event Impl c -> IO (IO (), IORef (Maybe (Maybe c)))
         doSub e = do
           occRef <- newIORef Nothing
-          (eUnsubscribe, _eOcc) <-
-            subscribeWith e (\_ occ -> writeIORef occRef (Just occ) >> pure Nothing) $ Subscriber $ \_ ->
+          (eUnsubscribe, _) <-
+            subscribeWith ((Nothing <$) . writeIORef occRef . Just) e . Subscriber $ \_ ->
               mapM_ (subscriberPropagate subscriber) =<< maybeResult
           pure (eUnsubscribe, occRef)
     (aUnsubscribe, aOccRef) <- doSub a
@@ -90,13 +87,14 @@ instance MonadMoment Impl IO where
   hold v0 e = do
     invsRef <- newIORef []
     valRef <- newIORef v0
-    addToQueue behaviorInitsRef $ void $ subscribeWith e
-      (const (mapM (\a -> addToQueue behaviorAssignmentsRef $ do
-                       writeIORef valRef a
-                       atomicModifyIORef invsRef ([],) >>=
-                         -- TODO: confusing code, make more obvious (the join in particular):
-                         mapM_ (join . (`atomicModifyIORef` (\i -> (Nothing, fromMaybe (pure ()) i)))))))
-      $ Subscriber $ const (pure ())
+    -- Make sure to touch 'e' eagerly, instead wait for Behavior init time.
+    addToQueue behaviorInitsRef $ void $ subscribeWith
+      (mapM (\a -> addToQueue behaviorAssignmentsRef $ do
+               writeIORef valRef a
+               atomicModifyIORef invsRef ([],) >>=
+                 mapM_ (\invRef -> readIORef invRef >>= mapM_ (\i -> writeIORef invRef Nothing >> i))))
+      e
+      . Subscriber $ const (pure ())
     pure $ Behavior $ ReaderT $ \invalidator -> do
       addToQueue invsRef invalidator
       readIORef valRef
@@ -131,21 +129,26 @@ type EventTrigger = IO ()
 newEvent :: IO (MakeEventTrigger a, Event Impl a)
 newEvent = do
   occRef <- newIORef Nothing -- Root event (non-)occurrence is always "known", thus Maybe a
-  let e = Event $ subscribeWith rootTickE (\_ -> const (readIORef occRef))
+  let e = Event $ subscribeWith (const (readIORef occRef)) rootTickE
   pure (writeAndScheduleClear occRef, e)
 
 subscribeEvent :: forall a. Event Impl a -> IO (IORef (Maybe a))
 subscribeEvent e = do
   occRef :: IORef (Maybe a) <- newIORef Nothing
-  _ <- subscribeWith e (\_ occ -> mapM_ (writeAndScheduleClear occRef) occ >> pure Nothing) $ Subscriber $ const (pure ())
+  _ <- subscribeWith (mapM (writeAndScheduleClear occRef)) e . Subscriber $ const (pure ())
   pure occRef
 
 
--- TODO: MaybeT IO (Maybe b)?
-subscribeWith :: Event Impl a -> (Unsubscribe -> Maybe a -> IO (Maybe b)) -> Subscriber b -> IO (Unsubscribe, Maybe (Maybe b))
-subscribeWith e f subscriber = mdo
-  ~(unsubscribe, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate subscriber <=< f unsubscribe
+-- | Subscribe to an event while mapping a function over it. This is
+-- mapMomentMaybe and subscribe combined. Passes the unsubscribe
+-- action to 'f' without FixIO cycles.
+subscribeWith' :: (Unsubscribe -> Maybe a -> IO (Maybe b)) -> Event Impl a -> Subscriber b -> IO (Unsubscribe, Maybe (Maybe b))
+subscribeWith' f e subscriber = mdo
+  (unsubscribe, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate subscriber <=< f unsubscribe
   fmap (unsubscribe,) .  mapM (f unsubscribe) $ occ
+
+subscribeWith :: (Maybe a -> IO (Maybe b)) -> Event Impl a -> Subscriber b -> IO (Unsubscribe, Maybe (Maybe b))
+subscribeWith f = subscribeWith' (const f)
 
 runFrame :: [EventTrigger] -> IO a -> IO a
 runFrame triggers program = do
@@ -168,18 +171,17 @@ cacheEvent e = unsafePerformIO $ do
   subscribersRef <- newIORef mempty
   ctrRef <- newIORef 0
   occRef <- newIORef Nothing
-  void . subscribeWith e (\_ occ -> writeAndScheduleClear occRef occ >> pure occ) $ Subscriber $ \occ ->
+  void . subscribeWith (\occ -> writeAndScheduleClear occRef occ >> pure occ) e . Subscriber $ \occ ->
     mapM_ (`subscriberPropagate` occ) =<< readIORef subscribersRef
   pure $ Event $ \sub -> do
     thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
     modifyIORef subscribersRef $ IntMap.insert thisSubId sub
     (modifyIORef subscribersRef (IntMap.delete thisSubId),) <$> readIORef occRef
-  
+
 writeAndScheduleClear :: IORef (Maybe a) -> a -> IO ()
 writeAndScheduleClear occRef a = do
   prev <- readIORef occRef
-  when (isJust prev) $ do
-    error "occRef written twice"
+  when (isJust prev) $ error "occRef written twice---loop?"
   writeIORef occRef (Just a)
   addToQueue toClearQueueRef (writeIORef occRef Nothing)
 
