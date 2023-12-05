@@ -16,7 +16,7 @@ import Control.Monad
 import Data.IORef
 import Data.Align (Semialign(..))
 import Data.These
-import Data.Maybe (isJust, fromMaybe)
+import Data.Maybe (isJust)
 import System.IO.Unsafe ( unsafePerformIO, unsafeInterleaveIO )
 import qualified Data.IntMap as IntMap
 import Control.Monad.Reader (ReaderT(..))
@@ -31,9 +31,17 @@ type Unsubscribe = IO ()
 type Invalidator = IORef (Maybe (IO ()))
 
 instance Frp Impl where
+  -- | Events are subscribed to with a propagation callback which is
+  -- run whenever the event has an occurrence. Subscribing to an event
+  -- returns both an unsubscribe action, which when called guarantees
+  -- that the callback will stop receiving occurrences, and wether an
+  -- occurrence is known for the current frame. If the 
   newtype Event Impl a = Event
     { subscribeAndRead :: Subscriber a -> IO (Unsubscribe, Maybe (Maybe a)) }
-  newtype Behavior Impl a = Behavior (ReaderT Invalidator IO a)
+  -- | Behaviors are sampling functions which are passed an optional
+  -- "invalidator". This invalidator is run when the Behavior's value
+  -- might be changing.
+  newtype Behavior Impl a = Behavior (ReaderT (Maybe Invalidator) IO a)
     deriving (Functor, Applicative, Monad, MonadFix)
   type Moment Impl = IO
 
@@ -80,7 +88,7 @@ instance Frp Impl where
   switch (Behavior switchParent) = cacheEvent $ Event $ \sub ->
     fix $ \f -> mdo
       maybeInvalidator <- newIORef . Just $ unsubscribeInnerE >> void f
-      e <- runReaderT switchParent maybeInvalidator
+      e <- runReaderT switchParent (Just maybeInvalidator)
       (unsubscribeInnerE, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate sub
       pure (writeIORef maybeInvalidator Nothing >> unsubscribeInnerE, occ)
 
@@ -98,7 +106,7 @@ instance MonadMoment Impl IO where
       e
       . Subscriber $ const (pure ())
     pure $ Behavior $ ReaderT $ \invalidator -> do
-      addToQueue invsRef invalidator
+      mapM_ (addToQueue invsRef) invalidator
       readIORef valRef
 
   now :: Moment Impl (Event Impl ())
@@ -106,7 +114,7 @@ instance MonadMoment Impl IO where
 
   sample :: Behavior Impl a -> Moment Impl a
   sample (Behavior b) = do
-    res <- unsafeInterleaveIO . runReaderT b =<< newIORef Nothing
+    res <- unsafeInterleaveIO . runReaderT b $ Nothing
     addToQueue behaviorInitsRef $ void . evaluate $ res
     pure res
 
@@ -165,10 +173,11 @@ runFrame triggers program = do
       runHoldInits
   atomicModifyIORef toClearQueueRef ([],) >>= mapM_ (\(Some (Compose occRef)) -> writeIORef occRef Nothing)
   atomicModifyIORef behaviorAssignmentsRef ([],)
-    >>= mapM_ (\(BehaviorAssignment valRef a invsRef) -> do
+    >>= mapM_ (\(BehaviorAssignment valRef a invalidatorsRef) -> do
                   writeIORef valRef a
-                  atomicModifyIORef invsRef ([],) >>=
-                    mapM_ (\invRef -> readIORef invRef >>= mapM_ (\i -> writeIORef invRef Nothing >> i)))
+                  atomicModifyIORef invalidatorsRef ([],) >>=
+                    mapM_ (\invalidatorRef -> mapM_ (\i -> writeIORef invalidatorRef Nothing >> i)
+                                              <=< readIORef $ invalidatorRef))
   pure res
 
 cacheEvent :: forall a. Event Impl a -> Event Impl a
