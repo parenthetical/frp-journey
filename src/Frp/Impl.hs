@@ -21,6 +21,8 @@ import System.IO.Unsafe ( unsafePerformIO, unsafeInterleaveIO )
 import qualified Data.IntMap as IntMap
 import Control.Monad.Reader (ReaderT(..))
 import GHC.IO (evaluate)
+import Data.Functor.Compose
+import Data.Some
 
 data Impl
 
@@ -161,8 +163,7 @@ runFrame triggers program = do
       writeIORef behaviorInitsRef []
       sequence_ inits
       runHoldInits
-  -- TODO: write IORefs to queue
-  atomicModifyIORef toClearQueueRef ([],) >>= sequence_
+  atomicModifyIORef toClearQueueRef ([],) >>= mapM_ (\(Some (Compose occRef)) -> writeIORef occRef Nothing)
   atomicModifyIORef behaviorAssignmentsRef ([],) >>= sequence_
   pure res
 
@@ -183,13 +184,13 @@ writeAndScheduleClear occRef a = do
   prev <- readIORef occRef
   when (isJust prev) $ error "occRef written twice---loop?"
   writeIORef occRef (Just a)
-  addToQueue toClearQueueRef (writeIORef occRef Nothing)
+  addToQueue toClearQueueRef (Some (Compose occRef))
 
 addToQueue :: IORef [a] -> a -> IO ()
 addToQueue q a = modifyIORef q (a:)
 
 {-# NOINLINE toClearQueueRef #-}
-toClearQueueRef :: IORef [a]
+toClearQueueRef :: IORef [Some (Compose IORef Maybe)]
 toClearQueueRef = unsafePerformIO $ newIORef []
 
 {-# NOINLINE behaviorAssignmentsRef #-}
