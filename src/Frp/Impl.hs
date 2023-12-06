@@ -28,7 +28,7 @@ data Impl
 
 newtype Subscriber a = Subscriber { subscriberPropagate :: Maybe a -> IO () }
 type Unsubscribe = IO ()
-type Invalidator = IORef (Maybe (IO ()))
+type Invalidator = IO ()
 
 instance Frp Impl where
   -- | Events are subscribed to with a propagation callback which is
@@ -87,10 +87,11 @@ instance Frp Impl where
   switch :: Behavior Impl (Event Impl a) -> Event Impl a
   switch (Behavior switchParent) = cacheEvent $ Event $ \sub ->
     fix $ \f -> mdo
-      maybeInvalidator <- newIORef . Just $ unsubscribeInnerE >> void f
-      e <- runReaderT switchParent (Just maybeInvalidator)
+      maybeInvalidatorRef <- newIORef . Just $ unsubscribeInnerE >> void f
+      e <- runReaderT switchParent $ Just $
+        readIORef maybeInvalidatorRef >>= mapM_ (writeIORef maybeInvalidatorRef Nothing >>)
       (unsubscribeInnerE, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate sub
-      pure (writeIORef maybeInvalidator Nothing >> unsubscribeInnerE, occ)
+      pure (writeIORef maybeInvalidatorRef Nothing >> unsubscribeInnerE, occ)
 
 data BehaviorAssignment where
   BehaviorAssignment :: IORef a -> a -> IORef [Invalidator] -> BehaviorAssignment
@@ -175,9 +176,7 @@ runFrame triggers program = do
   atomicModifyIORef behaviorAssignmentsRef ([],)
     >>= mapM_ (\(BehaviorAssignment valRef a invalidatorsRef) -> do
                   writeIORef valRef a
-                  atomicModifyIORef invalidatorsRef ([],) >>=
-                    mapM_ (\invalidatorRef -> mapM_ (\i -> writeIORef invalidatorRef Nothing >> i)
-                                              <=< readIORef $ invalidatorRef))
+                  atomicModifyIORef invalidatorsRef ([],) >>= sequence_)
   pure res
 
 cacheEvent :: forall a. Event Impl a -> Event Impl a
