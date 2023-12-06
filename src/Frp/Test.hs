@@ -196,6 +196,7 @@ testCases =
       let ee = flip mapMoment e $ const $ pure m
       pure $ coincidence ee
 
+  , testE "headE-0" $ headE =<< events1
   , testE "headE-1" $ do
       e <- events1
       headE $ leftmost [e, e]
