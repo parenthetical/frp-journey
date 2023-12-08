@@ -109,17 +109,37 @@ instance MonadMoment Impl IO where
 {-# NOINLINE _root #-}
 _root :: (Event Impl (), IO ())
 _root@(rootTickE, propagateRoot) = unsafePerformIO $ do
+  (eCached, doPropagate) <- managedSubscribersEvent
+  pure (eCached, doPropagate (Just ()))
+
+managedSubscribersEvent :: IO (Event Impl a, Maybe a -> IO ())
+managedSubscribersEvent = do
   subscribersRef <- newIORef mempty
   ctrRef <- newIORef 0
   occRef <- newIORef Nothing
-  pure ( Event $ \propagate -> do
-           thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
-           modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
-           mapM_ propagate =<< readIORef occRef
-           pure $ modifyIORef subscribersRef (IntMap.delete thisSubId)
-       , do writeAndScheduleClear "root" occRef (Just ())
-            mapM_ (`subscriberPropagate` Just ()) =<< readIORef subscribersRef
-       )
+  pure
+    ( Event $ \propagate -> do
+        thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
+        let unsubscribeThis = do
+              old <- readIORef subscribersRef
+              unless (IntMap.member thisSubId old) $ error "managedSubscribers unsubscribed twice"
+              modifyIORef subscribersRef (IntMap.delete thisSubId)
+        modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
+        -- If occRef is already Just we have to propagate on subscribe
+        -- because the subscription on e has already propagated:
+        mapM_ propagate =<< readIORef occRef
+        pure unsubscribeThis,
+      \occ -> do
+        writeAndScheduleClear "managedSubscribers" occRef occ
+        mapM_ ($ occ) =<< readIORef subscribersRef
+    )
+
+cacheEvent :: forall a. Event Impl a -> Event Impl a
+cacheEvent e = unsafePerformIO $ do
+  (eCached, doPropagate) <- managedSubscribersEvent
+  void . subscribe e $ doPropagate
+  pure eCached
+
 
 type MakeEventTrigger a = (a -> EventTrigger)
 type EventTrigger = IO ()
@@ -156,22 +176,6 @@ runFrame triggers program = do
                   writeIORef valRef a
                   atomicModifyIORef invalidatorsRef ([],) >>= sequence_)
   pure res
-
-cacheEvent :: forall a. Event Impl a -> Event Impl a
-cacheEvent e = unsafePerformIO $ do
-  subscribersRef <- newIORef mempty
-  ctrRef <- newIORef 0
-  occRef <- newIORef Nothing
-  void . subscribe e $ \occ -> do
-    writeAndScheduleClear "cacheEvent" occRef occ
-    mapM_ (`subscriberPropagate` occ) =<< readIORef subscribersRef
-  pure $ Event $ \propagate -> do
-    thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
-    modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
-    -- If occRef is already Just we have to propagate on subscribe
-    -- because the subscription on e has already propagated:
-    mapM_ (subscriberPropagate propagate) =<< readIORef occRef
-    pure $ modifyIORef subscribersRef (IntMap.delete thisSubId)
 
 writeAndScheduleClear :: String -> IORef (Maybe a) -> a -> IO ()
 writeAndScheduleClear name occRef a = do
