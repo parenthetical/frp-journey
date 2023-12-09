@@ -21,8 +21,6 @@ import System.IO.Unsafe ( unsafePerformIO, unsafeInterleaveIO )
 import qualified Data.IntMap as IntMap
 import Control.Monad.Reader (ReaderT(..))
 import GHC.IO (evaluate)
-import Data.Functor.Compose
-import Data.Some
 
 data Impl
 
@@ -53,18 +51,8 @@ instance Frp Impl where
   mapMaybeMoment f e = cacheEvent $ Event $ \propagate -> subscribe e $ propagate <=< fmap join . mapM f
 
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
-  coincidence coincidenceParent = cacheEvent $ Event $ \propagate -> do
-    subscribe coincidenceParent $ do
-      maybe (propagate Nothing) $ \e -> do
-        innerEUnsubscribeRef :: IORef (IO ()) <- newIORef $ pure ()
-        occWasKnownRef <- newIORef False
-        unsubscribe <- subscribe e (\occ -> do
-                                       writeIORef occWasKnownRef True
-                                       join (readIORef innerEUnsubscribeRef)
-                                       propagate occ)
-        writeIORef innerEUnsubscribeRef unsubscribe
-        occKnown <- readIORef occWasKnownRef
-        when occKnown unsubscribe
+  coincidence e = cacheEvent $ Event $ \propagate -> do
+    subscribe e $ maybe (propagate Nothing) (addToQueue toClearQueueRef <=< (`subscribe` propagate))
 
   merge :: forall a b. Event Impl a -> Event Impl b -> Event Impl (These a b)
   merge a b = cacheEvent $ Event $ \propagate -> do
@@ -173,7 +161,7 @@ runFrame triggers program = do
       writeIORef behaviorInitsRef []
       sequence_ inits
       runHoldInits
-  atomicModifyIORef toClearQueueRef ([],) >>= mapM_ (\(Some (Compose occRef)) -> writeIORef occRef Nothing)
+  atomicModifyIORef toClearQueueRef ([],) >>= sequence_
   atomicModifyIORef behaviorAssignmentsRef ([],)
     >>= mapM_ (\(BehaviorAssignment valRef a invalidatorsRef) -> do
                   writeIORef valRef a
@@ -185,13 +173,13 @@ writeAndScheduleClear name occRef a = do
   prev <- readIORef occRef
   when (isJust prev) $ error $ "occRef written twice---loop? -- " <> name
   writeIORef occRef (Just a)
-  addToQueue toClearQueueRef (Some (Compose occRef))
+  addToQueue toClearQueueRef $ writeIORef occRef Nothing
 
 addToQueue :: IORef [a] -> a -> IO ()
 addToQueue q a = modifyIORef q (a:)
 
 {-# NOINLINE toClearQueueRef #-}
-toClearQueueRef :: IORef [Some (Compose IORef Maybe)]
+toClearQueueRef :: IORef [IO ()]
 toClearQueueRef = unsafePerformIO $ newIORef []
 
 {-# NOINLINE behaviorAssignmentsRef #-}
