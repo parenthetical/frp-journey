@@ -50,7 +50,7 @@ instance Frp Impl where
   never = undefined <$ FRP.filterE (const False) rootTickE
 
   mapMaybeMoment :: (a -> Moment Impl (Maybe b)) -> Event Impl a -> Event Impl b
-  mapMaybeMoment f e = Event $ \propagate -> subscribe e $ propagate <=< fmap join . mapM f
+  mapMaybeMoment f e = cacheEvent $ Event $ \propagate -> subscribe e $ propagate <=< fmap join . mapM f
 
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
   coincidence coincidenceParent = cacheEvent $ Event $ \propagate -> do
