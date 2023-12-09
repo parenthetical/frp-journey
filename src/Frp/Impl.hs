@@ -54,8 +54,17 @@ instance Frp Impl where
 
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
   coincidence coincidenceParent = cacheEvent $ Event $ \propagate -> do
-    subscribe coincidenceParent $
-      maybe (propagate Nothing) (addToQueue unsubscribeQueueRef <=< (`subscribe` propagate))
+    subscribe coincidenceParent $ do
+      maybe (propagate Nothing) $ \e -> do
+        innerEUnsubscribeRef :: IORef (IO ()) <- newIORef $ pure ()
+        occWasKnownRef <- newIORef False
+        unsubscribe <- subscribe e (\occ -> do
+                                       writeIORef occWasKnownRef True
+                                       join (readIORef innerEUnsubscribeRef)
+                                       propagate occ)
+        writeIORef innerEUnsubscribeRef unsubscribe
+        occKnown <- readIORef occWasKnownRef
+        when occKnown unsubscribe
 
   merge :: forall a b. Event Impl a -> Event Impl b -> Event Impl (These a b)
   merge a b = cacheEvent $ Event $ \propagate -> do
@@ -169,7 +178,6 @@ runFrame triggers program = do
       sequence_ inits
       runHoldInits
   atomicModifyIORef toClearQueueRef ([],) >>= mapM_ (\(Some (Compose occRef)) -> writeIORef occRef Nothing)
-  atomicModifyIORef unsubscribeQueueRef ([],) >>= sequence_
   atomicModifyIORef behaviorAssignmentsRef ([],)
     >>= mapM_ (\(BehaviorAssignment valRef a invalidatorsRef) -> do
                   writeIORef valRef a
@@ -189,10 +197,6 @@ addToQueue q a = modifyIORef q (a:)
 {-# NOINLINE toClearQueueRef #-}
 toClearQueueRef :: IORef [Some (Compose IORef Maybe)]
 toClearQueueRef = unsafePerformIO $ newIORef []
-
-{-# NOINLINE unsubscribeQueueRef #-}
-unsubscribeQueueRef :: IORef [IO ()]
-unsubscribeQueueRef = unsafePerformIO $ newIORef []
 
 {-# NOINLINE behaviorAssignmentsRef #-}
 behaviorAssignmentsRef :: IORef [BehaviorAssignment]
