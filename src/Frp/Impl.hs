@@ -70,16 +70,18 @@ instance Frp Impl where
                       writeIORef aOccRef Nothing >> writeIORef bOccRef Nothing
                       propagate occRes)
               =<< liftA2 align <$> readIORef aOccRef <*> readIORef bOccRef
-    seq <$> doSub aOccRef a <*> doSub bOccRef b
+    (>>) <$> doSub aOccRef a <*> doSub bOccRef b
 
   switch :: Behavior Impl (Event Impl a) -> Event Impl a
-  switch (Behavior switchParent) = cacheEvent $ Event $ \propagate ->
+  switch (Behavior switchParent) = cacheEvent $ Event $ \propagate -> do
+    unsubscribeInnerERef <- newIORef $ error "unsubscribeInnerERef uninitialized"
+    maybeInvalidatorRef <- newIORef $ error "maybeInvalidatorRef uninitialized"
     fix $ \f -> mdo
-      maybeInvalidatorRef <- newIORef . Just $ unsubscribeInnerE >> void f
-      e <- runReaderT switchParent $ Just $
-        readIORef maybeInvalidatorRef >>= mapM_ (writeIORef maybeInvalidatorRef Nothing >>)
-      unsubscribeInnerE <- subscribe e propagate
-      pure (writeIORef maybeInvalidatorRef Nothing >> unsubscribeInnerE)
+      writeIORef maybeInvalidatorRef . Just $ unsubscribeInnerE >> f
+      unsubscribeInnerE <- (`subscribe` propagate)
+                           <=< runReaderT switchParent $ Just $ sequence_ =<< readIORef maybeInvalidatorRef
+      writeIORef unsubscribeInnerERef unsubscribeInnerE
+    pure (writeIORef maybeInvalidatorRef Nothing >> join (readIORef unsubscribeInnerERef))
 
 data BehaviorAssignment where
   BehaviorAssignment :: IORef a -> a -> IORef [Invalidator] -> BehaviorAssignment
