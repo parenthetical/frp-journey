@@ -122,16 +122,15 @@ managedSubscribersEvent = do
   pure
     ( Event $ \propagate -> do
         thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
-        let unsubscribeThis = do
-              old <- readIORef subscribersRef
-              unless (IntMap.member thisSubId old) $ error "managedSubscribers unsubscribed twice"
-              modifyIORef subscribersRef (IntMap.delete thisSubId)
         modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
         -- If occRef is already Just we have to propagate on subscribe
         -- because the subscription on e has already propagated:
         mapM_ propagate =<< readIORef occRef
-        pure unsubscribeThis,
-      \occ -> do
+        pure $ do
+          old <- readIORef subscribersRef
+          unless (IntMap.member thisSubId old) $ error "managedSubscribers unsubscribed twice"
+          modifyIORef subscribersRef (IntMap.delete thisSubId)
+    , \occ -> do
         writeAndScheduleClear "managedSubscribers" occRef occ
         mapM_ ($ occ) =<< readIORef subscribersRef
     )
