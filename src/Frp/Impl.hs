@@ -30,8 +30,6 @@ type Subscriber a = Maybe a -> IO ()
 type Unsubscribe = IO ()
 type Invalidator = IO ()
 
-subscriberPropagate = id
-
 instance Frp Impl where
   -- | Events are subscribed to with a callback which runs whenever
   -- the event has a known (non)-occurrence. Subscribing to an event
