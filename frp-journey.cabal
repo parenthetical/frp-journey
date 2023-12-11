@@ -80,7 +80,10 @@ library
                       containers,
                       mtl,
                       witherable,
-                      transformers
+                      transformers,
+                      either,
+                      dependent-map,
+                      patch
 
     -- Directories containing source files.
     hs-source-dirs:   src
