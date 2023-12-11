@@ -26,9 +26,9 @@ import Data.Some
 
 data Impl
 
-newtype Subscriber a = Subscriber { subscriberPropagate :: Maybe a -> IO () }
 type Unsubscribe = IO ()
 type Invalidator = IO ()
+type Propagate a = Maybe a -> IO ()
 
 instance Frp Impl where
   -- | Events are subscribed to with a callback which runs whenever
@@ -38,7 +38,7 @@ instance Frp Impl where
   -- occurrence is known for the current frame. If the occurrence is
   -- already known the callback is not called.
   newtype Event Impl a = Event
-    { subscribeAndRead :: Subscriber a -> IO (Unsubscribe, Maybe (Maybe a)) }
+    { subscribeAndRead :: Propagate a -> IO (Unsubscribe, Maybe (Maybe a)) }
   -- | Behaviors are sampling functions which are passed an optional
   -- "invalidator". This invalidator is run when the Behavior's value
   -- might be changing.
@@ -53,20 +53,20 @@ instance Frp Impl where
   mapMaybeMoment f = Event .  subscribeWith (fmap join . mapM f)
 
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
-  coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
+  coincidence coincidenceParent = cacheEvent $ Event $ \propagate -> do
     let f = fmap join -- TODO: awkward
           . mapM (maybe
                   (pure (Just Nothing))
                   (\innerE -> fmap snd . subscribeWith'
                      (\unsubscribeInner occ -> unsubscribeInner >> pure occ) innerE
-                     . Subscriber $ subscriberPropagate sub))
+                     $ propagate))
     (unsubscribeOuter, occOuter) <-
-      subscribeAndRead coincidenceParent $ Subscriber $ mapM_ (subscriberPropagate sub) <=< f . Just
+      subscribeAndRead coincidenceParent $ mapM_ propagate <=< f . Just
     occ <- f occOuter
     pure (unsubscribeOuter, occ)
 
   merge :: forall a b. Event Impl a -> Event Impl b -> Event Impl (These a b)
-  merge a b = cacheEvent $ Event $ \subscriber -> mdo
+  merge a b = cacheEvent $ Event $ \propagate -> mdo
     let maybeResult :: IO (Maybe (Maybe (These a b)))
         maybeResult = do
           res <- liftA2 align <$> readIORef aOccRef <*> readIORef bOccRef
@@ -78,20 +78,20 @@ instance Frp Impl where
         doSub e = do
           occRef <- newIORef Nothing
           (eUnsubscribe, _) <-
-            subscribeWith ((Nothing <$) . writeIORef occRef . Just) e . Subscriber $ \_ ->
-              mapM_ (subscriberPropagate subscriber) =<< maybeResult
+            subscribeWith ((Nothing <$) . writeIORef occRef . Just) e $ \_ ->
+              mapM_ propagate =<< maybeResult
           pure (eUnsubscribe, occRef)
     (aUnsubscribe, aOccRef) <- doSub a
     (bUnsubscribe, bOccRef) <- doSub b
     (aUnsubscribe >> bUnsubscribe,) <$> maybeResult
 
   switch :: Behavior Impl (Event Impl a) -> Event Impl a
-  switch (Behavior switchParent) = cacheEvent $ Event $ \sub ->
+  switch (Behavior switchParent) = cacheEvent $ Event $ \propagate ->
     fix $ \f -> mdo
       maybeInvalidatorRef <- newIORef . Just $ unsubscribeInnerE >> void f
       e <- runReaderT switchParent $ Just $
         readIORef maybeInvalidatorRef >>= mapM_ (writeIORef maybeInvalidatorRef Nothing >>)
-      (unsubscribeInnerE, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate sub
+      (unsubscribeInnerE, occ) <- subscribeAndRead e propagate
       pure (writeIORef maybeInvalidatorRef Nothing >> unsubscribeInnerE, occ)
 
 data BehaviorAssignment where
@@ -105,8 +105,7 @@ instance MonadMoment Impl IO where
     -- Make sure not to touch 'e' eagerly, instead wait for Behavior init time.
     addToQueue behaviorInitsRef $ void $ subscribeWith
       (mapM (\a -> addToQueue behaviorAssignmentsRef $ BehaviorAssignment valRef a invsRef))
-      e
-      . Subscriber $ const (pure ())
+      e $ const (pure ())
     pure $ Behavior $ ReaderT $ \invalidator -> do
       mapM_ (addToQueue invsRef) invalidator
       readIORef valRef
@@ -130,12 +129,12 @@ _root@(rootTickE, propagateRoot) = unsafePerformIO $ do
   subscribersRef <- newIORef mempty
   ctrRef <- newIORef 0
   occRef <- newIORef Nothing
-  pure ( Event $ \sub -> do
+  pure ( Event $ \propagate -> do
            thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
-           modifyIORef subscribersRef $ IntMap.insert thisSubId sub
+           modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
            (modifyIORef subscribersRef (IntMap.delete thisSubId),) <$> readIORef occRef
        , do writeAndScheduleClear occRef (Just ())
-            mapM_ (`subscriberPropagate` Just ()) =<< readIORef subscribersRef
+            mapM_ ($ Just ()) =<< readIORef subscribersRef
        )
 
 type MakeEventTrigger a = (a -> EventTrigger)
@@ -150,19 +149,19 @@ newEvent = do
 subscribeEvent :: forall a. Event Impl a -> IO (IORef (Maybe a))
 subscribeEvent e = do
   occRef :: IORef (Maybe a) <- newIORef Nothing
-  _ <- subscribeWith (mapM (writeAndScheduleClear occRef)) e . Subscriber $ const (pure ())
+  _ <- subscribeWith (mapM (writeAndScheduleClear occRef)) e $ const (pure ())
   pure occRef
 
 
 -- | Subscribe to an event while mapping a function over it. This is
 -- mapMomentMaybe and subscribe combined. Passes the unsubscribe
 -- action to 'f' without FixIO cycles.
-subscribeWith' :: (Unsubscribe -> Maybe a -> IO (Maybe b)) -> Event Impl a -> Subscriber b -> IO (Unsubscribe, Maybe (Maybe b))
-subscribeWith' f e subscriber = mdo
-  (unsubscribe, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate subscriber <=< f unsubscribe
+subscribeWith' :: (Unsubscribe -> Maybe a -> IO (Maybe b)) -> Event Impl a -> Propagate b -> IO (Unsubscribe, Maybe (Maybe b))
+subscribeWith' f e propagate = mdo
+  (unsubscribe, occ) <- subscribeAndRead e $ propagate <=< f unsubscribe
   fmap (unsubscribe,) .  mapM (f unsubscribe) $ occ
 
-subscribeWith :: (Maybe a -> IO (Maybe b)) -> Event Impl a -> Subscriber b -> IO (Unsubscribe, Maybe (Maybe b))
+subscribeWith :: (Maybe a -> IO (Maybe b)) -> Event Impl a -> Propagate b -> IO (Unsubscribe, Maybe (Maybe b))
 subscribeWith f = subscribeWith' (const f)
 
 runFrame :: [EventTrigger] -> IO a -> IO a
@@ -188,11 +187,11 @@ cacheEvent e = unsafePerformIO $ do
   subscribersRef <- newIORef mempty
   ctrRef <- newIORef 0
   occRef <- newIORef Nothing
-  void . subscribeWith (\occ -> writeAndScheduleClear occRef occ >> pure occ) e . Subscriber $ \occ ->
-    mapM_ (`subscriberPropagate` occ) =<< readIORef subscribersRef
-  pure $ Event $ \sub -> do
+  void . subscribeWith (\occ -> writeAndScheduleClear occRef occ >> pure occ) e $ \occ ->
+    mapM_ ($ occ) =<< readIORef subscribersRef
+  pure $ Event $ \propagate -> do
     thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
-    modifyIORef subscribersRef $ IntMap.insert thisSubId sub
+    modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
     (modifyIORef subscribersRef (IntMap.delete thisSubId),) <$> readIORef occRef
 
 writeAndScheduleClear :: IORef (Maybe a) -> a -> IO ()
