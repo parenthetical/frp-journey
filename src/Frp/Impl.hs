@@ -122,21 +122,6 @@ instance MonadMoment Impl IO where
   liftMoment :: Moment Impl a -> IO a
   liftMoment = id
 
--- | The root event
-{-# NOINLINE _root #-}
-_root :: (Event Impl (), IO ())
-_root@(rootTickE, propagateRoot) = unsafePerformIO $ do
-  subscribersRef <- newIORef mempty
-  ctrRef <- newIORef 0
-  occRef <- newIORef Nothing
-  pure ( Event $ \propagate -> do
-           thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
-           modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
-           (modifyIORef subscribersRef (IntMap.delete thisSubId),) <$> readIORef occRef
-       , do writeAndScheduleClear occRef (Just ())
-            mapM_ ($ Just ()) =<< readIORef subscribersRef
-       )
-
 type MakeEventTrigger a = (a -> EventTrigger)
 type EventTrigger = IO ()
 
@@ -182,17 +167,36 @@ runFrame triggers program = do
                   atomicModifyIORef invalidatorsRef ([],) >>= sequence_)
   pure res
 
-cacheEvent :: forall a. Event Impl a -> Event Impl a
-cacheEvent e = unsafePerformIO $ do
+managedSubscribersEvent :: IO (Event Impl a, Maybe a -> IO (), Propagate a)
+managedSubscribersEvent = do
   subscribersRef <- newIORef mempty
   ctrRef <- newIORef 0
   occRef <- newIORef Nothing
-  void . subscribeWith (\occ -> writeAndScheduleClear occRef occ >> pure occ) e $ \occ ->
-    mapM_ ($ occ) =<< readIORef subscribersRef
-  pure $ Event $ \propagate -> do
-    thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
-    modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
-    (modifyIORef subscribersRef (IntMap.delete thisSubId),) <$> readIORef occRef
+  pure ( Event $ \propagate -> do
+          thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
+          modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
+          -- If occRef is already Just we have to propagate on subscribe
+          -- because the subscription on e has already propagated:
+          (do old <- readIORef subscribersRef
+              unless (IntMap.member thisSubId old) $ error "managedSubscribers unsubscribed twice"
+              modifyIORef subscribersRef (IntMap.delete thisSubId)
+            ,) <$> readIORef occRef
+      , writeAndScheduleClear occRef
+      , \occ -> mapM_ ($ occ) =<< readIORef subscribersRef
+      )
+
+-- | The root event
+{-# NOINLINE _root #-}
+_root :: (Event Impl (), IO ())
+_root@(rootTickE, propagateRoot) = unsafePerformIO $ do
+  (e, set, doPropagate) <- managedSubscribersEvent
+  pure (e, set (Just ()) >> doPropagate (Just ()))
+
+cacheEvent :: forall a. Event Impl a -> Event Impl a
+cacheEvent e = unsafePerformIO $ do
+  (eCached, set, doPropagate) <- managedSubscribersEvent
+  void . subscribeWith (\occ -> set occ >> pure occ) e $ doPropagate
+  pure eCached
 
 writeAndScheduleClear :: IORef (Maybe a) -> a -> IO ()
 writeAndScheduleClear occRef a = do
