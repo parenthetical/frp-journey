@@ -30,3 +30,4 @@ instance (Ord t, Enum t) => MonadMoment (Pure t) ((->) t) where
     else case e (pred t) of
       Just a' -> a'
       Nothing -> sample (hold a (Event e) from) (pred t)
+  liftMoment = id

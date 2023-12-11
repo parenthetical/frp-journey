@@ -2,7 +2,6 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE PartialTypeSignatures #-}
 module Frp.Test where
 
@@ -10,13 +9,12 @@ import Frp.Impl
 import Frp.Class
 import Data.Kind (Type)
 import Control.Monad.State
-import Data.IORef (IORef, readIORef)
+import Data.IORef (readIORef)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
 import System.Mem (performGC)
 import Witherable (catMaybes)
 import Frp.Pure hiding (sample)
-import Data.IntSet
 import qualified Frp.Pure as Pure
 import Data.Bifunctor (first)
 import qualified Data.IntSet as IntSet
@@ -27,6 +25,9 @@ import qualified Data.Map as Map
 import System.Exit
 import Data.Char (toUpper)
 import Data.Functor (void)
+import Data.Functor.Misc (Const2(..))
+import Data.IntSet (IntSet)
+import qualified Data.List.NonEmpty as NonEmpty
 
 newtype PlanImpl a where
   PlanImpl :: (StateT Schedule (Moment Impl) a) -> PlanImpl a
@@ -36,6 +37,7 @@ instance MonadMoment Impl PlanImpl where
   hold a = PlanImpl . lift . hold a
   now = PlanImpl . lift $ now
   sample = PlanImpl . lift . sample
+  liftMoment = PlanImpl . lift . liftMoment
 
 type Schedule = IntMap [IO ()]
 
@@ -46,6 +48,7 @@ instance MonadMoment (Pure Int) PlanPure where
   hold a = PlanPure . lift . hold a
   now = PlanPure . lift $ now
   sample = PlanPure . lift . sample
+  liftMoment = PlanPure . lift . liftMoment
 
 
 bla :: (TestPlan t m) => m (Event t _)
@@ -308,16 +311,16 @@ testCases =
       pure $ join bb
 
 
-  -- , testB "foldDyn"  $ do
-  --     d <- foldDyn (++) "0" =<< events1
-  --     pure (current d)
+  , testB "foldDyn"  $ do
+      d <- foldDyn (++) "0" =<< events1
+      pure (current d)
 
-  -- , testB "foldDynWhileFiring"  $ do
-  --   e <- events1
-  --   d <- foldDyn (:) [] $
-  --     mapMoment (\a -> foldDyn (:) [a] e) e
+  , testB "foldDynWhileFiring"  $ do
+    e <- events1
+    d <- foldDyn (:) [] $
+      mapMoment (\a -> foldDyn (:) [a] e) e
 
-  --   pure $ current (join (fmap distributeListOverDynPure d))
+    pure $ current (join (fmap distributeListOverDyn d))
 
   , testE "joinDyn" $ do
       e <- events1
@@ -328,24 +331,24 @@ testCases =
       let eInner = switch bd
       pure $ leftmost [eOuter, eInner]
 
-  -- , testB "mapDyn"  $ do
-  --     d <- foldDyn (++) "0" =<< events1
-  --     pure $ current $ fmap (fmap toUpper) d
+  , testB "mapDyn"  $ do
+      d <- foldDyn (++) "0" =<< events1
+      pure $ current $ fmap (fmap toUpper) d
 
-  -- , testB "combineDyn"  $ do
-  --     d1 <- foldDyn (++) "0" =<< events1
-  --     d2 <- fmap (fmap (fmap toUpper)) $ foldDyn (++) "0" =<< events2
+  , testB "combineDyn"  $ do
+      d1 <- foldDyn (++) "0" =<< events1
+      d2 <- fmap (fmap (fmap toUpper)) $ foldDyn (++) "0" =<< events2
 
-  --     pure $ current $ zipDynWith (<>) d1 d2
+      pure $ current $ zipDynWith (<>) d1 d2
 
-  -- , testB "buildDynamicStrictness"  $ do
-  --     rec
-  --       d'' <- pushDyn pure d'
-  --       d' <- pushDyn pure d
-  --       d <- holdDyn "0" =<< events1
+  , testB "buildDynamicStrictness"  $ do
+      rec
+        d'' <- pushDyn pure d'
+        d' <- pushDyn pure d
+        d <- holdDyn "0" =<< events1
 
-  --     _ <- sample (current d'')
-  --     pure (current d'')
+      _ <- sample (current d'')
+      pure (current d'')
 
   , testB "holdSampleStrictness-0"  $ do
       rec
@@ -363,48 +366,48 @@ testCases =
   --     let unFactor = either id id
   --     pure $ current (join (fmap unFactor eithers'))
 
-  -- , testB "pushDynDeep"  $ do
-  --     _ <- events1
-  --     _ <- events2
+  , testB "pushDynDeep"  $ do
+      _ <- events1
+      _ <- events2
 
-  --     d1 <- holdDyn "d1" =<< events1
-  --     d2 <- holdDyn "d2" =<< events2
+      d1 <- holdDyn "d1" =<< events1
+      d2 <- holdDyn "d2" =<< events2
 
-  --     d <- flip pushDyn d1 $ \a ->
-  --       flip pushDyn d2 $ \b ->
-  --         flip pushDyn d1 $ \c ->
-  --           pure (a <> b <> c)
+      d <- flip pushDyn d1 $ \a ->
+        flip pushDyn d2 $ \b ->
+          flip pushDyn d1 $ \c ->
+            pure (a <> b <> c)
 
-  --     d' <- pushDyn scanInnerDyns d >>= scanInnerDyns
-  --     pure $ current d'
+      d' <- pushDyn scanInnerDyns d >>= scanInnerDyns
+      pure $ current d'
 
-  -- , testE "fan-1" $ do
-  --     e <- fmap toMap <$> events1
-  --     let es = select (fanMap e) . Const2 <$> values
+  , testE "fan-1" $ do
+      e <- fmap toMap <$> events1
+      let es = select (fanMap e) . Const2 <$> values
 
-  --     pure (mergeList es)
+      pure (mergeList es)
 
-  -- , testE "fan-2" $ do
-  --     e <- fmap toMap <$> events3
-  --     let es = select (fanMap e) . Const2 <$> values
+  , testE "fan-2" $ do
+      e <- fmap toMap <$> events3
+      let es = select (fanMap e) . Const2 <$> values
 
-  --     pure (mergeList es)
+      pure (mergeList es)
 
-  -- , testE "fan-3" $ do
-  --     f <- fanMap . fmap toMap <$> events3
-  --     pure $  select f (Const2 'c')
+  , testE "fan-3" $ do
+      f <- fanMap . fmap toMap <$> events3
+      pure $  select f (Const2 'c')
 
-  -- , testE "fan-4" $ do
-  --     e <- fmap toMap <$> events1
-  --     pure $ toUpper <$> select (fanMap e) (Const2 'a')
+  , testE "fan-4" $ do
+      e <- fmap toMap <$> events1
+      pure $ toUpper <$> select (fanMap e) (Const2 'a')
 
-  -- , testE "fan-5" $ do
-  --     e <- fmap toMap <$> events2
-  --     pure $ toUpper <$> select (fanMap e) (Const2 'c')
+  , testE "fan-5" $ do
+      e <- fmap toMap <$> events2
+      pure $ toUpper <$> select (fanMap e) (Const2 'c')
 
-  -- , testE "fan-6" $ do
-  --     f <- fanMap . fmap toMap <$> events1
-  --     pure $ toList <$> mergeList [ select f (Const2 'b'), select f (Const2 'b'), select f (Const2 'e'), select f (Const2 'e') ]
+  , testE "fan-6" $ do
+      f <- fanMap . fmap toMap <$> events1
+      pure $ NonEmpty.toList <$> mergeList [ select f (Const2 'b'), select f (Const2 'b'), select f (Const2 'e'), select f (Const2 'e') ]
 
   , testE "difference" $ do
       e1 <- events1
@@ -440,7 +443,6 @@ testCases =
     eithers ::  TestPlan t m => m (Event t (Either String String))
     eithers = plan [(1, Left "e"), (3, Left "d"), (4, Right "c"), (6, Right "b"), (7, Left "a")]
 
-
     values = "abcde"
     toMap str = Map.fromList $ fmap (\c -> (c, c)) str
 
@@ -450,3 +452,21 @@ testCases =
 
     deep e = leftmost [e, e]
     leftmost2 e1 e2 = leftmost [e1, e2]
+
+    pushDyn :: (Frp t, MonadMoment t m, Monad m) => (a -> Moment t b) -> Dynamic t a -> m (Dynamic t b)
+    pushDyn f d = do
+      i <- liftMoment $ sample (current d) >>= f
+      let e = mapMoment f (updated d)
+      (e `unsafeBuildDynamic`) <$> hold i e
+    foldedDyn :: (Frp t, MonadMoment t m, Monad m) => (a -> a -> a) -> Dynamic t a -> m (Dynamic t a)
+    foldedDyn f d = fmap join $ flip buildDynamic never $ do
+     a <- sample (current d)
+     foldDyn f a (updated d)
+    
+    scannedDyn :: (Frp t, MonadMoment t m, Monad m) => Dynamic t a -> m (Dynamic t [a])
+    scannedDyn = fmap (fmap reverse) . foldedDyn (<>) . fmap pure
+    
+    scanInnerDyns :: (Frp t, MonadMoment t m, Monad m) => Dynamic t (Dynamic t a) -> m (Dynamic t [a])
+    scanInnerDyns d = do
+      scans <- scannedDyn d
+      return (join (fmap distributeListOverDyn scans))

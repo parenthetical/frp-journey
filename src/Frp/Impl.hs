@@ -120,6 +120,9 @@ instance MonadMoment Impl IO where
     addToQueue behaviorInitsRef $ void . evaluate $ res
     pure res
 
+  liftMoment :: Moment Impl a -> IO a
+  liftMoment = id
+
 -- | The root event
 {-# NOINLINE _root #-}
 _root :: (Event Impl (), IO ())
