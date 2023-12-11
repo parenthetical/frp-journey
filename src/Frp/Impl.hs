@@ -86,13 +86,14 @@ instance Frp Impl where
     (aUnsubscribe >> bUnsubscribe,) <$> maybeResult
 
   switch :: Behavior Impl (Event Impl a) -> Event Impl a
-  switch (Behavior switchParent) = cacheEvent $ Event $ \propagate ->
-    fix $ \f -> mdo
-      maybeInvalidatorRef <- newIORef . Just $ unsubscribeInnerE >> void f
-      e <- runReaderT switchParent $ Just $
-        readIORef maybeInvalidatorRef >>= mapM_ (writeIORef maybeInvalidatorRef Nothing >>)
+  switch (Behavior switchParent) = cacheEvent $ Event $ \propagate -> do
+    maybeUnsubscribeInnerERef <- newIORef $ error "maybeUnsubscribeInnerERef uninitialized"
+    fix $ \f -> do
+      e <- runReaderT switchParent $ Just $ mapM_ (>> f) =<< readIORef maybeUnsubscribeInnerERef
       (unsubscribeInnerE, occ) <- subscribeAndRead e propagate
-      pure (writeIORef maybeInvalidatorRef Nothing >> unsubscribeInnerE, occ)
+      writeIORef maybeUnsubscribeInnerERef . Just $ unsubscribeInnerE
+      pure ( readIORef maybeUnsubscribeInnerERef >>= mapM_ (>> writeIORef maybeUnsubscribeInnerERef Nothing)
+           , occ)
 
 data BehaviorAssignment where
   BehaviorAssignment :: IORef a -> a -> IORef [Invalidator] -> BehaviorAssignment
