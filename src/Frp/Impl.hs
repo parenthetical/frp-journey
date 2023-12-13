@@ -26,12 +26,12 @@ import Data.Some
 
 data Impl
 
-type Subscriber a = Unsubscribe -> Maybe a -> IO ()
+type Subscriber a = Unsubscribe -> IO (Maybe a -> IO ())
 type Unsubscribe = IO ()
 type Invalidator = IO ()
 
 subscribe' :: Event Impl a -> (Maybe a -> IO ()) -> IO ()
-subscribe' e f = subscribe e (const f)
+subscribe' e f = subscribe e (const (pure f))
 
 instance Frp Impl where
   -- | Events are subscribed to with a callback which runs whenever
@@ -52,28 +52,27 @@ instance Frp Impl where
   never = undefined <$ FRP.filterE (const False) rootTickE
 
   mapMaybeMoment :: (a -> Moment Impl (Maybe b)) -> Event Impl a -> Event Impl b
-  mapMaybeMoment f e = cacheEvent $ Event $ \propagate -> subscribe e $ \unsubscribe -> propagate unsubscribe <=< fmap join . mapM f
+  mapMaybeMoment f e = cacheEvent $ Event $ \propagate -> subscribe e $ fmap (<=< fmap join . mapM f) . propagate
 
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
   coincidence coincidenceParent = cacheEvent $ Event $ \propagate' -> do
-    subscribe coincidenceParent $ \unsubscribeOuter ->
-      let propagate = propagate' unsubscribeOuter
-      in maybe (propagate Nothing) (`subscribe` \unsubscribeInner occ -> unsubscribeInner >> propagate occ)
+    subscribe coincidenceParent $ \unsubscribeOuter -> do
+      propagate <- propagate' unsubscribeOuter
+      pure $ maybe (propagate Nothing) (`subscribe` \unsubscribeInner -> pure $ \occ -> unsubscribeInner >> propagate occ)
 
   merge :: forall a b. Event Impl a -> Event Impl b -> Event Impl (These a b)
-  merge a b = cacheEvent $ Event $ \propagate -> do
+  merge a b = cacheEvent $ Event $ \propagate' -> do
     aOccRef <- newIORef Nothing
     bOccRef <- newIORef Nothing
     aUnsubscribeRef <- newIORef $ error "aUnsubscribe uninitialized"
     bUnsubscribeRef <- newIORef $ error "bUnsubscribe uninitialized"
+    propagate <- propagate' (join (readIORef aUnsubscribeRef) >> join (readIORef bUnsubscribeRef))
     let doSub :: forall c. IORef (Maybe (Maybe c)) -> IORef Unsubscribe -> Event Impl c -> IO ()
-        doSub occRef unsubscribeRef e = subscribe e $ \unsubscribe -> unsafePerformIO $ do
+        doSub occRef unsubscribeRef e = subscribe e $ \unsubscribe -> do
           writeIORef unsubscribeRef unsubscribe
           pure $ \occ -> do
             writeIORef occRef . Just $ occ
-            mapM_ (\occRes -> do
-                      writeIORef aOccRef Nothing >> writeIORef bOccRef Nothing
-                      propagate (join (readIORef aUnsubscribeRef) >> join (readIORef bUnsubscribeRef)) occRes)
+            mapM_ ((writeIORef aOccRef Nothing >> writeIORef bOccRef Nothing >>) . propagate)
               =<< liftA2 align <$> readIORef aOccRef <*> readIORef bOccRef
     doSub aOccRef aUnsubscribeRef a
     doSub bOccRef bUnsubscribeRef b
@@ -83,9 +82,9 @@ instance Frp Impl where
     maybeUnsubscribeInnerERef <- newIORef $ error "unsubscribeInnerERef uninitialized"
     fix $ \f ->
       runReaderT switchParent (Just $ mapM_ (>> f) =<< readIORef maybeUnsubscribeInnerERef)
-      >>= (`subscribe` \unsubscribeInnerE -> unsafePerformIO $ do
+      >>= (`subscribe` \unsubscribeInnerE -> do
               writeIORef maybeUnsubscribeInnerERef (Just unsubscribeInnerE)
-              pure $ propagate (writeIORef maybeUnsubscribeInnerERef Nothing >> unsubscribeInnerE))
+              propagate (writeIORef maybeUnsubscribeInnerERef Nothing >> unsubscribeInnerE))
 
 data BehaviorAssignment where
   BehaviorAssignment :: IORef a -> a -> IORef [Invalidator] -> BehaviorAssignment
@@ -129,7 +128,7 @@ managedSubscribersEvent = do
   pure
     ( Event $ \propagate -> do
         thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
-        let propagate' = propagate $ do
+        propagate' <- propagate $ do
              old <- readIORef subscribersRef
              unless (IntMap.member thisSubId old) $ error "managedSubscribers unsubscribed twice"
              modifyIORef subscribersRef (IntMap.delete thisSubId)
