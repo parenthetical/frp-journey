@@ -32,9 +32,7 @@ instance Frp Impl where
   -- | Events are subscribed to with a callback which runs whenever
   -- the event has a known (non)-occurrence. Subscribing to an event
   -- returns both an unsubscribe action, which when called guarantees
-  -- that the callback will stop receiving occurrences, and wether an
-  -- occurrence is known for the current frame. If the occurrence is
-  -- already known the callback is not called.
+  -- that the callback will stop receiving occurrences.
   newtype Event Impl a = Event
     { subscribe :: Subscriber a -> IO Unsubscribe }
   -- | Behaviors are sampling functions which are passed an optional
