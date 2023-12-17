@@ -66,10 +66,11 @@ instance Frp Impl where
     (>>) <$> doSub aOccRef a <*> doSub bOccRef b
 
   switch :: Behavior Impl (Event Impl a) -> Event Impl a
-  switch (Behavior switchParent) = cacheEvent $ Event $ \propagate -> do
-    maybeUnsubscribeInnerERef <- newIORef $ error "maybeUnsubscribeInnerERef uninitialized"
-    fix $ \f -> writeIORef maybeUnsubscribeInnerERef . Just
-      <=< (`subscribe` propagate) <=< runReaderT switchParent $ Just $ mapM_ (>> f) =<< readIORef maybeUnsubscribeInnerERef
+  switch (Behavior switchParent) = cacheEvent $ Event $ \propagate -> mdo
+    maybeUnsubscribeInnerERef <-
+      newIORef <=< fix $ \f -> fmap Just . (`subscribe` propagate)
+      =<< runReaderT switchParent
+           (Just $ mapM_ (>> (writeIORef maybeUnsubscribeInnerERef =<< f)) =<< readIORef maybeUnsubscribeInnerERef)
     pure $ readIORef maybeUnsubscribeInnerERef >>= mapM_ (>> writeIORef maybeUnsubscribeInnerERef Nothing)
 
 data BehaviorAssignment where
