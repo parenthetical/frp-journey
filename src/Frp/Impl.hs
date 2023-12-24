@@ -31,7 +31,7 @@ type Invalidator = IO ()
 instance Frp Impl where
   -- | Events are subscribed to with a callback which runs whenever
   -- the event has a known (non)-occurrence. Subscribing to an event
-  -- returns both an unsubscribe action, which when called guarantees
+  -- returns an unsubscribe action, which when called guarantees
   -- that the callback will stop receiving occurrences.
   newtype Event Impl a = Event
     { subscribe :: Subscriber a -> IO Unsubscribe }
