@@ -168,6 +168,11 @@ runFrame triggers program = do
     >>= mapM_ (\(BehaviorAssignment valRef a invalidatorsRef) -> do
                   writeIORef valRef a
                   atomicModifyIORef invalidatorsRef ([],) >>= sequence_)
+  flip unless (error "queues were not empty after runFrame")
+    . and =<< sequence [ null <$> readIORef behaviorInitsRef
+                       , null <$> readIORef toClearQueueRef
+                       , null <$> readIORef behaviorAssignmentsRef
+                       ]
   pure res
 
 writeAndScheduleClear :: String -> IORef (Maybe a) -> a -> IO ()
