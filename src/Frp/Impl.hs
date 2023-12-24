@@ -124,7 +124,7 @@ managedSubscribersEvent = do
           unless (IntMap.member thisSubId old) $ error "managedSubscribers unsubscribed twice"
           modifyIORef subscribersRef (IntMap.delete thisSubId)
     , \occ -> do
-        writeAndScheduleClear "managedSubscribers" occRef occ
+        writeAndScheduleClear occRef occ
         mapM_ ($ occ) =<< readIORef subscribersRef
     )
 
@@ -141,7 +141,7 @@ type EventTrigger = IO ()
 newEvent :: IO (MakeEventTrigger a, Event Impl a)
 newEvent = do
   occRef <- newIORef Nothing -- Root event (non-)occurrence is always "known", thus Maybe a
-  pure (writeAndScheduleClear "newEvent" occRef, mapMaybeMoment (const (readIORef occRef)) rootTickE)
+  pure (writeAndScheduleClear occRef, mapMaybeMoment (const (readIORef occRef)) rootTickE)
 
 subscribeEvent :: forall a. Event Impl a -> IO (IORef (Maybe a))
 subscribeEvent e = do
@@ -149,7 +149,7 @@ subscribeEvent e = do
   -- notify the user that they tried to read an event occurrence
   -- outside of a frame. Maybe subscribeEvent should return a read action which throws an exception.
   occRef :: IORef (Maybe a) <- newIORef Nothing
-  _ <- subscribe e $ mapM_ (writeAndScheduleClear "subscribeEvent" occRef)
+  _ <- subscribe e $ mapM_ (writeAndScheduleClear occRef)
   pure occRef
 
 runFrame :: [EventTrigger] -> IO a -> IO a
@@ -175,10 +175,10 @@ runFrame triggers program = do
                        ]
   pure res
 
-writeAndScheduleClear :: String -> IORef (Maybe a) -> a -> IO ()
-writeAndScheduleClear name occRef a = do
+writeAndScheduleClear :: IORef (Maybe a) -> a -> IO ()
+writeAndScheduleClear occRef a = do
   prev <- readIORef occRef
-  when (isJust prev) $ error $ "occRef written twice---loop? -- " <> name
+  when (isJust prev) $ error $ "occRef written twice---loop?"
   writeIORef occRef (Just a)
   addToQueue toClearQueueRef $ writeIORef occRef Nothing
 
