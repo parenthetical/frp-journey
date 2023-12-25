@@ -3,8 +3,6 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TypeFamilies #-}
 
--- | The rules for this implementation are: an event can only receive a propagation once per time frame, and if its occurrence is known on subscription it will never propagate.
-
 module Frp.Impl
 (newEvent, subscribeEvent, runFrame, Impl)
 where
@@ -145,9 +143,6 @@ newEvent = do
 
 subscribeEvent :: forall a. Event Impl a -> IO (IORef (Maybe a))
 subscribeEvent e = do
-  -- TODO: add extra safety by having (Maybe (Maybe a))? This would
-  -- notify the user that they tried to read an event occurrence
-  -- outside of a frame. Maybe subscribeEvent should return a read action which throws an exception.
   occRef :: IORef (Maybe a) <- newIORef Nothing
   _ <- subscribe e $ mapM_ (writeAndScheduleClear occRef)
   pure occRef
