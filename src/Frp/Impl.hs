@@ -26,30 +26,45 @@ type Subscriber a = Maybe a -> IO ()
 type Unsubscribe = IO ()
 type Invalidator = IO ()
 
+-- | The root event 'rootTickE' has an occurrence whenever any event might have one. The
+-- 'propagateRoot' action causes the root event to propagate with a unit-valued occurrence.
+{-# NOINLINE rootTickE #-}
+{-# NOINLINE propagateRoot #-}
+rootTickE :: Event Impl ()
+propagateRoot :: IO ()
+(rootTickE, propagateRoot) = unsafePerformIO $ do
+  (eCached, doPropagate) <- managedSubscribersEvent
+  pure (eCached, doPropagate (Just ()))
+
 instance Frp Impl where
-  -- | Events are subscribed to with a callback which runs whenever
-  -- the event has a known (non)-occurrence. Subscribing to an event
-  -- returns an unsubscribe action, which when called guarantees
-  -- that the callback will stop receiving occurrences.
-  newtype Event Impl a = Event
-    { subscribe :: Subscriber a -> IO Unsubscribe }
-  -- | Behaviors are sampling functions which are passed an optional
-  -- "invalidator". This invalidator is run when the Behavior's value
-  -- might be changing.
+  -- | Events are subscribed to with a callback called whenever the event has a known
+  -- (non)-occurrence. Subscribing to an event returns an unsubscribe action. Unsubscribing
+  -- immediately stops any callbacks from happening.
+  newtype Event Impl a = Event { subscribe :: Subscriber a -> IO Unsubscribe }
+  -- | Behaviors are sampling functions which are passed an optional invalidator. This invalidator
+  -- is run when the Behavior's value might change (but it could also stay the same).
   newtype Behavior Impl a = Behavior (ReaderT (Maybe Invalidator) IO a)
     deriving (Functor, Applicative, Monad, MonadFix)
+
   type Moment Impl = IO
 
+  -- | Never is implemented by filtering out all occurences from the root event.
   never :: Event Impl a
   never = undefined <$ FRP.filterE (const False) rootTickE
 
   mapMaybeMoment :: (a -> Moment Impl (Maybe b)) -> Event Impl a -> Event Impl b
   mapMaybeMoment f e = cacheEvent $ Event $ \propagate -> subscribe e $ propagate <=< fmap join . mapM f
 
+  -- | When the outer event is known to not have an occurrence, propagate non-occurrence. Otherwise,
+  -- subscribe to the inner occurrence and queue-up its unsubscribe action.  It's possible to write
+  -- the implementation so that unsubscribing happens immediately but using the queue made things
+  -- more succinct.
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
   coincidence e = cacheEvent $ Event $ \propagate -> do
     subscribe e $ maybe (propagate Nothing) (addToEnvQueue toClearQueueRef <=< (`subscribe` propagate))
 
+  -- | Subscribe to both merge inputs and cache the occurrences. When both (non-)occurrences are
+  -- known, propagate and clear the caches.
   merge :: forall a b. Event Impl a -> Event Impl b -> Event Impl (These a b)
   merge a b = cacheEvent $ Event $ \propagate -> do
     aOccRef <- newIORef Nothing
@@ -57,6 +72,8 @@ instance Frp Impl where
     let doSub :: forall c. IORef (Maybe (Maybe c)) -> Event Impl c -> IO Unsubscribe
         doSub occRef e = subscribe e $ \occ -> do
             writeIORef occRef . Just $ occ
+            -- Check if we have both inputs when any input is called. If yes, clear caches and
+            -- propagate.
             mapM_ (\occRes -> do
                       writeIORef aOccRef Nothing
                       writeIORef bOccRef Nothing
@@ -64,6 +81,11 @@ instance Frp Impl where
               =<< liftA2 align <$> readIORef aOccRef <*> readIORef bOccRef
     (>>) <$> doSub aOccRef a <*> doSub bOccRef b
 
+  -- | Switch keeps the unsubscribe to the inner event in an 'IORef (Maybe Unsubscribe)'. As long as
+  -- the result event of switch is subscribed to the IORef is kept as Just Unsubscribe. On
+  -- unsubscribing it's set to Nothing. When switchParent's invalidator is run the old inner event
+  -- is unsubscribed from and the IORef set to the new one. The invalidator only runs if the IORef
+  -- is Just-valued still.
   switch :: Behavior Impl (Event Impl a) -> Event Impl a
   switch (Behavior switchParent) = cacheEvent $ Event $ \propagate -> mdo
     maybeUnsubscribeInnerERef <- newIORef <=< fix $ \f ->
@@ -98,13 +120,6 @@ instance MonadMoment Impl IO where
 
   liftMoment :: Moment Impl a -> IO a
   liftMoment = id
-
--- | The root event
-{-# NOINLINE _root #-}
-_root :: (Event Impl (), IO ())
-_root@(rootTickE, propagateRoot) = unsafePerformIO $ do
-  (eCached, doPropagate) <- managedSubscribersEvent
-  pure (eCached, doPropagate (Just ()))
 
 managedSubscribersEvent :: IO (Event Impl a, Maybe a -> IO ())
 managedSubscribersEvent = do
