@@ -50,7 +50,7 @@ instance Frp Impl where
 
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
   coincidence e = cacheEvent $ Event $ \propagate -> do
-    subscribe e $ maybe (propagate Nothing) (addToQueue toClearQueueRef <=< (`subscribe` propagate))
+    subscribe e $ maybe (propagate Nothing) (addToEnvQueue toClearQueueRef <=< (`subscribe` propagate))
 
   merge :: forall a b. Event Impl a -> Event Impl b -> Event Impl (These a b)
   merge a b = cacheEvent $ Event $ \propagate -> do
@@ -60,7 +60,8 @@ instance Frp Impl where
         doSub occRef e = subscribe e $ \occ -> do
             writeIORef occRef . Just $ occ
             mapM_ (\occRes -> do
-                      writeIORef aOccRef Nothing >> writeIORef bOccRef Nothing
+                      writeIORef aOccRef Nothing
+                      writeIORef bOccRef Nothing
                       propagate occRes)
               =<< liftA2 align <$> readIORef aOccRef <*> readIORef bOccRef
     (>>) <$> doSub aOccRef a <*> doSub bOccRef b
@@ -82,10 +83,10 @@ instance MonadMoment Impl IO where
     invsRef <- newIORef []
     valRef <- newIORef v0
     -- Make sure not to touch 'e' eagerly, instead wait for Behavior init time.
-    addToQueue behaviorInitsRef $ void $ subscribe e $
-      mapM_ (\a -> addToQueue behaviorAssignmentsRef $ BehaviorAssignment valRef a invsRef)
+    addToEnvQueue behaviorInitsRef $ void $ subscribe e $
+      mapM_ (\a -> addToEnvQueue behaviorAssignmentsRef $ BehaviorAssignment valRef a invsRef)
     pure $ Behavior $ ReaderT $ \invalidator -> do
-      mapM_ (addToQueue invsRef) invalidator
+      mapM_ (modifyIORef invsRef . (:)) invalidator
       readIORef valRef
 
   now :: Moment Impl (Event Impl ())
@@ -94,7 +95,7 @@ instance MonadMoment Impl IO where
   sample :: Behavior Impl a -> Moment Impl a
   sample (Behavior b) = do
     res <- unsafeInterleaveIO . runReaderT b $ Nothing
-    addToQueue behaviorInitsRef $ void . evaluate $ res
+    addToEnvQueue behaviorInitsRef $ void . evaluate $ res
     pure res
 
   liftMoment :: Moment Impl a -> IO a
@@ -134,7 +135,6 @@ cacheEvent e = unsafePerformIO $ do
   void . subscribe e $ doPropagate
   pure eCached
 
-
 type MakeEventTrigger a = (a -> EventTrigger)
 type EventTrigger = IO ()
 
@@ -154,6 +154,7 @@ subscribeEvent e = do
 
 runFrame :: [EventTrigger] -> IO a -> IO a
 runFrame triggers program = do
+  let (Env { toClearQueueRef, behaviorInitsRef, behaviorAssignmentsRef }) = theEnv
   sequence_ triggers
   propagateRoot
   res <- program
@@ -178,21 +179,19 @@ runFrame triggers program = do
 writeAndScheduleClear :: IORef (Maybe a) -> a -> IO ()
 writeAndScheduleClear occRef a = do
   prev <- readIORef occRef
-  when (isJust prev) $ error $ "occRef written twice---loop?"
+  when (isJust prev) $ error "occRef written twice---loop?"
   writeIORef occRef (Just a)
-  addToQueue toClearQueueRef $ writeIORef occRef Nothing
+  addToEnvQueue toClearQueueRef $ writeIORef occRef Nothing
 
-addToQueue :: IORef [a] -> a -> IO ()
-addToQueue q a = modifyIORef q (a:)
+data Env = Env
+  { toClearQueueRef :: IORef [IO ()]
+  , behaviorInitsRef :: IORef [IO ()]
+  , behaviorAssignmentsRef :: IORef [BehaviorAssignment]
+  }
 
-{-# NOINLINE toClearQueueRef #-}
-toClearQueueRef :: IORef [IO ()]
-toClearQueueRef = unsafePerformIO $ newIORef []
+{-# NOINLINE theEnv #-}
+theEnv :: Env
+theEnv = unsafePerformIO $ Env <$> newIORef [] <*> newIORef [] <*> newIORef []
 
-{-# NOINLINE behaviorAssignmentsRef #-}
-behaviorAssignmentsRef :: IORef [BehaviorAssignment]
-behaviorAssignmentsRef = unsafePerformIO $ newIORef []
-
-{-# NOINLINE behaviorInitsRef #-}
-behaviorInitsRef :: IORef [IO ()]
-behaviorInitsRef = unsafePerformIO $ newIORef []
+addToEnvQueue :: (Env -> IORef [a]) -> a -> IO ()
+addToEnvQueue selector a = modifyIORef (selector theEnv) (a:)
