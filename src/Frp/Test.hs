@@ -50,16 +50,9 @@ instance MonadMoment (Pure Int) PlanPure where
   sample = PlanPure . lift . sample
   liftMoment = PlanPure . lift . liftMoment
 
-
-bla :: (TestPlan t m) => m (Event t _)
-bla = do
-  events1 <- plan [(1, "a"), (2, "b"), (5, "c"), (7, "d"), (8, "e")]
-  events2 <- plan [(1, "e"), (3, "d"), (4, "c"), (6, "b"), (7, "a")]
-  pure $ merge events1 events2
-
 instance () => TestPlan Impl PlanImpl where
   plan occurrences = PlanImpl $ do
-    (makeTrigger, e) <- lift $ newEvent
+    (makeTrigger, e) <- liftIO $ newEvent
     modify . IntMap.unionWith mappend . IntMap.fromList
       . fmap (\(t,a) -> (fromIntegral t, [makeTrigger a]))
       $ occurrences
@@ -77,17 +70,17 @@ instance TestPlan (Pure Int) PlanPure where
 
 runPlanImplE :: PlanImpl (Event Impl b) -> IO (IntMap b)
 runPlanImplE (PlanImpl x) = do
-  (e,s) <- runStateT x mempty
-  occRef <- subscribeEvent e
+  (e,s) <- unMomentImpl $ runStateT x mempty
+  readOcc <- subscribeEvent e
   catMaybes
     <$> traverse (\occs -> do
                              performGC
-                             runFrame occs (readIORef occRef))
+                             runFrame occs readOcc)
         (makeDense s)
 -- TODO: commonalities between runPlanImpl*
 runPlanImplB :: PlanImpl (Behavior Impl b) -> IO (IntMap b)
 runPlanImplB (PlanImpl x) = do
-  (b,s) <- runStateT x mempty
+  (b,s) <- unMomentImpl $ runStateT x mempty
   traverse (\occs -> do
                performGC
                runFrame occs (sample b))

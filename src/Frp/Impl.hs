@@ -4,7 +4,7 @@
 {-# LANGUAGE TypeFamilies #-}
 
 module Frp.Impl
-(newEvent, subscribeEvent, runFrame, Impl)
+(newEvent, subscribeEvent, runFrame, Impl, MomentImpl(..))
 where
 
 import Frp.Class
@@ -14,11 +14,12 @@ import Control.Monad
 import Data.IORef
 import Data.Align (Semialign(..))
 import Data.These
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, fromMaybe)
 import System.IO.Unsafe ( unsafePerformIO, unsafeInterleaveIO )
 import qualified Data.IntMap as IntMap
 import Control.Monad.Reader (ReaderT(..))
 import GHC.IO (evaluate)
+import Control.Monad.IO.Class (MonadIO)
 
 data Impl
 
@@ -26,36 +27,40 @@ type Subscriber a = Maybe a -> IO ()
 type Unsubscribe = IO ()
 type Invalidator = IO ()
 
--- | The root event 'rootTickE' has an occurrence whenever any event might have one. The
--- 'propagateRoot' action causes the root event to propagate with a unit-valued occurrence.
+-- | The root event 'rootTickE' has an occurrence whenever any event might have one.
 {-# NOINLINE rootTickE #-}
-{-# NOINLINE propagateRoot #-}
 rootTickE :: Event Impl ()
+-- | The 'propagateRoot' action causes the root event to propagate with a unit-valued occurrence.
+{-# NOINLINE propagateRoot #-}
 propagateRoot :: IO ()
 (rootTickE, propagateRoot) = unsafePerformIO $ do
   (eCached, doPropagate) <- managedSubscribersEvent
   pure (eCached, doPropagate (Just ()))
 
+newtype MomentImpl a = MomentImpl { unMomentImpl :: IO a }
+  deriving (Functor,Applicative,Monad,MonadFix, MonadIO)
+
+-- | 
 instance Frp Impl where
-  -- | Events are subscribed to with a callback called whenever the event has a known
+  -- Events are subscribed to with a callback called whenever the event has a known
   -- (non)-occurrence. Subscribing to an event returns an unsubscribe action. Unsubscribing
   -- immediately stops any callbacks from happening.
   newtype Event Impl a = Event { subscribe :: Subscriber a -> IO Unsubscribe }
-  -- | Behaviors are sampling functions which are passed an optional invalidator. This invalidator
+  -- Behaviors are sampling functions which are passed an optional invalidator. This invalidator
   -- is run when the Behavior's value might change (but it could also stay the same).
   newtype Behavior Impl a = Behavior (ReaderT (Maybe Invalidator) IO a)
     deriving (Functor, Applicative, Monad, MonadFix)
 
-  type Moment Impl = IO
+  type Moment Impl = MomentImpl
 
-  -- | Never is implemented by filtering out all occurences from the root event.
+  -- Never is implemented by filtering out all occurences from the root event.
   never :: Event Impl a
   never = undefined <$ FRP.filterE (const False) rootTickE
 
   mapMaybeMoment :: (a -> Moment Impl (Maybe b)) -> Event Impl a -> Event Impl b
-  mapMaybeMoment f e = cacheEvent $ Event $ \propagate -> subscribe e $ propagate <=< fmap join . mapM f
+  mapMaybeMoment f e = cacheEvent $ Event $ \propagate -> subscribe e $ propagate <=< fmap join . mapM (unMomentImpl . f)
 
-  -- | When the outer event is known to not have an occurrence, propagate non-occurrence. Otherwise,
+  -- When the outer event is known to not have an occurrence, propagate non-occurrence. Otherwise,
   -- subscribe to the inner occurrence and queue-up its unsubscribe action.  It's possible to write
   -- the implementation so that unsubscribing happens immediately but using the queue made things
   -- more succinct.
@@ -63,7 +68,7 @@ instance Frp Impl where
   coincidence e = cacheEvent $ Event $ \propagate -> do
     subscribe e $ maybe (propagate Nothing) (addToEnvQueue toClearQueueRef <=< (`subscribe` propagate))
 
-  -- | Subscribe to both merge inputs and cache the occurrences. When both (non-)occurrences are
+  -- Subscribe to both merge inputs and cache the occurrences. When both (non-)occurrences are
   -- known, propagate and clear the caches.
   merge :: forall a b. Event Impl a -> Event Impl b -> Event Impl (These a b)
   merge a b = cacheEvent $ Event $ \propagate -> do
@@ -81,7 +86,7 @@ instance Frp Impl where
               =<< liftA2 align <$> readIORef aOccRef <*> readIORef bOccRef
     (>>) <$> doSub aOccRef a <*> doSub bOccRef b
 
-  -- | Switch keeps the unsubscribe to the inner event in an 'IORef (Maybe Unsubscribe)'. As long as
+  -- Switch keeps the unsubscribe to the inner event in an 'IORef (Maybe Unsubscribe)'. As long as
   -- the result event of switch is subscribed to the IORef is kept as Just Unsubscribe. On
   -- unsubscribing it's set to Nothing. When switchParent's invalidator is run the old inner event
   -- is unsubscribed from and the IORef set to the new one. The invalidator only runs if the IORef
@@ -97,10 +102,14 @@ instance Frp Impl where
 data BehaviorAssignment where
   BehaviorAssignment :: IORef a -> a -> IORef [Invalidator] -> BehaviorAssignment
 
-instance MonadMoment Impl IO where
+instance MonadMoment Impl MomentImpl where
+  -- Hold returns a behavior which is initialized at behavior init time and changes at behavior
+  -- assignment time. Whenever the behavior is read an invalidator action can be added which is
+  -- called when the behavior changes.
   hold :: a -> Event Impl a -> Moment Impl (Behavior Impl a)
-  hold v0 e = do
-    invsRef <- newIORef []
+  hold v0 e = MomentImpl $ do
+    invsRef <- newIORef [] -- The list of invalidators that have to run whenever the result behavior
+                           -- changes.
     valRef <- newIORef v0
     -- Make sure not to touch 'e' eagerly, instead wait for Behavior init time.
     addToEnvQueue behaviorInitsRef $ void $ subscribe e $
@@ -112,15 +121,20 @@ instance MonadMoment Impl IO where
   now :: Moment Impl (Event Impl ())
   now = FRP.headE rootTickE
 
+  -- Sample takes extra care to be lazy by delaying the evaluation of the sampled behavior.  The
+  -- last moment by which the sample would need to be forced is behavior invalidation time, but here
+  -- I've forced the evaluation at the next behavior init time.
   sample :: Behavior Impl a -> Moment Impl a
-  sample (Behavior b) = do
+  sample (Behavior b) = MomentImpl $ do
     res <- unsafeInterleaveIO . runReaderT b $ Nothing
     addToEnvQueue behaviorInitsRef $ void . evaluate $ res
     pure res
 
-  liftMoment :: Moment Impl a -> IO a
+  liftMoment :: Moment Impl a -> MomentImpl a
   liftMoment = id
 
+-- | Returns an event which can have multiple subscribers and a propagating procedure. The propagator
+-- is not allowed to be called outside of a frame (this is unenforced)!
 managedSubscribersEvent :: IO (Event Impl a, Maybe a -> IO ())
 managedSubscribersEvent = do
   subscribersRef <- newIORef mempty
@@ -142,6 +156,7 @@ managedSubscribersEvent = do
         mapM_ ($ occ) =<< readIORef subscribersRef
     )
 
+-- | Cache event occurrences.
 cacheEvent :: forall a. Event Impl a -> Event Impl a
 cacheEvent e = unsafePerformIO $ do
   (eCached, doPropagate) <- managedSubscribersEvent
@@ -151,19 +166,25 @@ cacheEvent e = unsafePerformIO $ do
 type MakeEventTrigger a = (a -> EventTrigger)
 type EventTrigger = IO ()
 
+-- | Create a new event. Returns a "make trigger" function to which you can pass an occurrence value
+-- and obtain an 'EventTrigger' for use with 'runFrame', and the new event.
 newEvent :: IO (MakeEventTrigger a, Event Impl a)
 newEvent = do
   occRef <- newIORef Nothing -- Root event (non-)occurrence is always "known", thus Maybe a
-  pure (writeAndScheduleClear occRef, mapMaybeMoment (const (readIORef occRef)) rootTickE)
+  pure (writeAndScheduleClear occRef, mapMaybeMoment (const (MomentImpl $ readIORef occRef)) rootTickE)
 
-subscribeEvent :: forall a. Event Impl a -> IO (IORef (Maybe a))
+-- | Subscribe to an event to obtain an "read occurrence" action which will contain the event
+-- occurrence value when read inside the 'program' argument of 'runFrame'.
+subscribeEvent :: forall a. Event Impl a -> IO (MomentImpl (Maybe a))
 subscribeEvent e = do
-  occRef :: IORef (Maybe a) <- newIORef Nothing
-  _ <- subscribe e $ mapM_ (writeAndScheduleClear occRef)
-  pure occRef
+  occRef :: IORef (Maybe (Maybe a)) <- newIORef Nothing
+  _ <- subscribe e $ writeAndScheduleClear occRef
+  pure $ MomentImpl $ fromMaybe (error "Occurrence read outside of runFrame?") <$> readIORef occRef
 
-runFrame :: [EventTrigger] -> IO a -> IO a
-runFrame triggers program = do
+-- | Inside the second argument you can read Behaviors and read event occurrences after subscribing
+-- to an event.
+runFrame :: [EventTrigger] -> MomentImpl a -> IO a
+runFrame triggers (MomentImpl program) = do
   let (Env { toClearQueueRef, behaviorInitsRef, behaviorAssignmentsRef }) = theEnv
   sequence_ triggers
   propagateRoot
@@ -186,6 +207,7 @@ runFrame triggers program = do
                        ]
   pure res
 
+-- | Write a value to an event occurrence cache/IORef and schedule it to be cleared.
 writeAndScheduleClear :: IORef (Maybe a) -> a -> IO ()
 writeAndScheduleClear occRef a = do
   prev <- readIORef occRef
