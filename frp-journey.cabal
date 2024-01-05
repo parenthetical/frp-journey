@@ -57,6 +57,7 @@ common warnings
 library
     -- Import common warning flags.
     import:           warnings
+    ghc-options: -Wunused-packages
 
     -- Modules exported by the library.
     exposed-modules:  Frp.Class,
