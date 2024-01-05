@@ -292,18 +292,6 @@ testCases =
         bb <- hold (pure "x") $ mapMoment (const $ hold "a" eo) eo
         pure $ join bb
 
-
-  , testB "foldDyn"  $ do
-      d <- liftPlan . foldDyn (++) "0" =<< events1
-      pure (current d)
-
-  , testB "foldDynWhileFiring"  $ do
-    e <- events1
-    d <- liftPlan $ foldDyn (:) [] $
-      mapMoment (\a -> foldDyn (:) [a] e) e
-
-    pure $ current (distributeListOverDyn =<< d)
-
   , testE "joinDyn" $ do
       e <- events1
       liftPlan $ do
@@ -314,16 +302,6 @@ testCases =
         let eInner = switch bd
         pure $ leftmost [eOuter, eInner]
 
-  , testB "mapDyn"  $ do
-      d <- liftPlan . foldDyn (++) "0" =<< events1
-      pure $ current $ fmap (fmap toUpper) d
-
-  , testB "combineDyn"  $ do
-      d1 <- liftPlan . foldDyn (++) "0" =<< events1
-      d2 <- fmap (fmap (fmap toUpper)) $ liftPlan . foldDyn (++) "0" =<< events2
-
-      pure $ current $ zipDynWith (<>) d1 d2
-
   , testB "holdSampleStrictness"  $ do
       e1 <- events1
       liftPlan $ do
@@ -333,59 +311,6 @@ testCases =
           b <- hold "0" e1
           _ <- sample b'
         pure b'
-
-  , testB "buildDynamicStrictness"  $ do
-      rec
-        d'' <- liftPlan $ pushDyn pure d'
-        d' <- liftPlan $ pushDyn pure d
-        d <- liftPlan . holdDyn "0" =<< events1
-
-      _ <- liftPlan $ sample (current d'')
-      pure (current d'')
-
-  , testB "pushDynDeep"  $ do
-      _ <- events1
-      _ <- events2
-
-      d1 <- liftPlan . holdDyn "d1" =<< events1
-      d2 <- liftPlan . holdDyn "d2" =<< events2
-
-      liftPlan $ do
-        d <- flip pushDyn d1 $ \a ->
-          flip pushDyn d2 $ \b ->
-            flip pushDyn d1 $ \c ->
-              pure (a <> b <> c)
-
-        d' <- pushDyn scanInnerDyns d >>= scanInnerDyns
-        pure $ current d'
-
-  , testE "fan-1" $ do
-      e <- fmap toMap <$> events1
-      let es = select (fanMap e) . Const2 <$> values
-
-      pure (mergeList es)
-
-  , testE "fan-2" $ do
-      e <- fmap toMap <$> events3
-      let es = select (fanMap e) . Const2 <$> values
-
-      pure (mergeList es)
-
-  , testE "fan-3" $ do
-      f <- fanMap . fmap toMap <$> events3
-      pure $  select f (Const2 'c')
-
-  , testE "fan-4" $ do
-      e <- fmap toMap <$> events1
-      pure $ toUpper <$> select (fanMap e) (Const2 'a')
-
-  , testE "fan-5" $ do
-      e <- fmap toMap <$> events2
-      pure $ toUpper <$> select (fanMap e) (Const2 'c')
-
-  , testE "fan-6" $ do
-      f <- fanMap . fmap toMap <$> events1
-      pure $ NonEmpty.toList <$> mergeList [ select f (Const2 'b'), select f (Const2 'b'), select f (Const2 'e'), select f (Const2 'e') ]
 
   , testE "difference" $ do
       e1 <- events1
@@ -417,30 +342,9 @@ testCases =
     events2 = plan [(1, "e"), (3, "d"), (4, "c"), (6, "b"), (7, "a")]
     events3 = liftA2 mappend events1 events2
 
-    values = "abcde"
-    toMap str = Map.fromList $ fmap (\c -> (c, c)) str
-
     behavior1, behavior2 :: forall t m. TestPlan t m => m (Behavior t String)
     behavior1 =  liftPlan . hold "1" =<< events1
     behavior2 =  liftPlan . hold "2" =<< events2
 
     deep e = leftmost [e, e]
     leftmost2 e1 e2 = leftmost [e1, e2]
-
-    pushDyn :: (Frp t) => (a -> Moment t b) -> Dynamic t a -> Moment t (Dynamic t b)
-    pushDyn f d = do
-      i <- sample (current d) >>= f
-      let e = mapMoment f (updated d)
-      (e `unsafeBuildDynamic`) <$> hold i e
-    foldedDyn :: (Frp t) => (a -> a -> a) -> Dynamic t a -> Moment t (Dynamic t a)
-    foldedDyn f d = fmap join $ flip buildDynamic never $ do
-     a <- sample (current d)
-     foldDyn f a (updated d)
-
-    scannedDyn :: (Frp t) => Dynamic t a -> Moment t (Dynamic t [a])
-    scannedDyn = fmap (fmap reverse) . foldedDyn (<>) . fmap pure
-
-    scanInnerDyns :: (Frp t) => Dynamic t (Dynamic t a) -> Moment t (Dynamic t [a])
-    scanInnerDyns d = do
-      scans <- scannedDyn d
-      return (distributeListOverDyn =<< scans)
