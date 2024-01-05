@@ -7,8 +7,8 @@ module Frp.Impl
 (newEvent, subscribeEvent, runFrame, Impl, MomentImpl(..))
 where
 
+import Prelude hiding (filter)
 import Frp.Class
-import qualified Frp.Class as FRP
 import Control.Monad.Fix
 import Control.Monad
 import Data.IORef
@@ -20,6 +20,7 @@ import qualified Data.IntMap as IntMap
 import Control.Monad.Reader (ReaderT(..))
 import GHC.IO (evaluate)
 import Control.Monad.IO.Class (MonadIO)
+import Witherable
 
 data Impl
 
@@ -45,33 +46,32 @@ instance Frp Impl where
   -- Events are subscribed to with a callback called whenever the event has a known
   -- (non)-occurrence. Subscribing to an event returns an unsubscribe action. Unsubscribing
   -- immediately stops any callbacks from happening.
-  newtype Event Impl a = Event { subscribe :: Subscriber a -> IO Unsubscribe }
+  newtype Event Impl a = EventI { subscribe :: Subscriber a -> IO Unsubscribe }
   -- Behaviors are sampling functions which are passed an optional invalidator. This invalidator
   -- is run when the Behavior's value might change (but it could also stay the same).
-  newtype Behavior Impl a = Behavior (ReaderT (Maybe Invalidator) IO a)
+  newtype Behavior Impl a = BehaviorI (ReaderT (Maybe Invalidator) IO a)
     deriving (Functor, Applicative, Monad, MonadFix)
 
   type Moment Impl = MomentImpl
 
   -- Never is implemented by filtering out all occurences from the root event.
   never :: Event Impl a
-  never = undefined <$ FRP.filterE (const False) rootTickE
+  never = undefined <$ filter (const False) rootTickE
 
   mapMaybeMoment :: (a -> Moment Impl (Maybe b)) -> Event Impl a -> Event Impl b
-  mapMaybeMoment f e = cacheEvent $ Event $ \propagate -> subscribe e $ propagate <=< fmap join . mapM (unMomentImpl . f)
+  mapMaybeMoment f e = cacheEvent $ EventI $ \propagate -> subscribe e $ propagate <=< fmap join . mapM (unMomentImpl . f)
 
   -- When the outer event is known to not have an occurrence, propagate non-occurrence. Otherwise,
   -- subscribe to the inner occurrence and queue-up its unsubscribe action.  It's possible to write
   -- the implementation so that unsubscribing happens immediately but using the queue made things
   -- more succinct.
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
-  coincidence e = cacheEvent $ Event $ \propagate -> do
-    subscribe e $ maybe (propagate Nothing) (addToEnvQueue toClearQueueRef <=< (`subscribe` propagate))
+  coincidence e = cacheEvent $ EventI $ \propagate -> subscribe e $ maybe (propagate Nothing) (addToEnvQueue toClearQueueRef <=< (`subscribe` propagate))
 
   -- Subscribe to both merge inputs and cache the occurrences. When both (non-)occurrences are
   -- known, propagate and clear the caches.
   merge :: forall a b. Event Impl a -> Event Impl b -> Event Impl (These a b)
-  merge a b = cacheEvent $ Event $ \propagate -> do
+  merge a b = cacheEvent $ EventI $ \propagate -> do
     aOccRef <- newIORef Nothing
     bOccRef <- newIORef Nothing
     let doSub :: forall c. IORef (Maybe (Maybe c)) -> Event Impl c -> IO Unsubscribe
@@ -92,17 +92,12 @@ instance Frp Impl where
   -- is unsubscribed from and the IORef set to the new one. The invalidator only runs if the IORef
   -- is Just-valued still.
   switch :: Behavior Impl (Event Impl a) -> Event Impl a
-  switch (Behavior switchParent) = cacheEvent $ Event $ \propagate -> mdo
+  switch (BehaviorI switchParent) = cacheEvent $ EventI $ \propagate -> mdo
     maybeUnsubscribeInnerERef <- newIORef <=< fix $ \f ->
       fmap Just . (`subscribe` propagate)
       <=< runReaderT switchParent . Just
       $ readIORef maybeUnsubscribeInnerERef >>= mapM_ (>> (f >>= writeIORef maybeUnsubscribeInnerERef))
     pure $ readIORef maybeUnsubscribeInnerERef >>= mapM_ (>> writeIORef maybeUnsubscribeInnerERef Nothing)
-
-data BehaviorAssignment where
-  BehaviorAssignment :: IORef a -> a -> IORef [Invalidator] -> BehaviorAssignment
-
-instance MonadMoment Impl MomentImpl where
   -- Hold returns a behavior which is initialized at behavior init time and changes at behavior
   -- assignment time. Whenever the behavior is read an invalidator action can be added which is
   -- called when the behavior changes.
@@ -114,24 +109,25 @@ instance MonadMoment Impl MomentImpl where
     -- Make sure not to touch 'e' eagerly, instead wait for Behavior init time.
     addToEnvQueue behaviorInitsRef $ void $ subscribe e $
       mapM_ (\a -> addToEnvQueue behaviorAssignmentsRef $ BehaviorAssignment valRef a invsRef)
-    pure $ Behavior $ ReaderT $ \invalidator -> do
+    pure $ BehaviorI $ ReaderT $ \invalidator -> do
       mapM_ (modifyIORef invsRef . (:)) invalidator
       readIORef valRef
 
   now :: Moment Impl (Event Impl ())
-  now = FRP.headE rootTickE
+  now = headE rootTickE
 
   -- Sample takes extra care to be lazy by delaying the evaluation of the sampled behavior.  The
   -- last moment by which the sample would need to be forced is behavior invalidation time, but here
   -- I've forced the evaluation at the next behavior init time.
   sample :: Behavior Impl a -> Moment Impl a
-  sample (Behavior b) = MomentImpl $ do
-    res <- unsafeInterleaveIO . runReaderT b $ Nothing
+  sample (BehaviorI b) = MomentImpl $ do
+    res <- unsafeInterleaveIO $ runReaderT b Nothing
     addToEnvQueue behaviorInitsRef $ void . evaluate $ res
     pure res
 
-  liftMoment :: Moment Impl a -> MomentImpl a
-  liftMoment = id
+data BehaviorAssignment where
+  BehaviorAssignment :: IORef a -> a -> IORef [Invalidator] -> BehaviorAssignment
+
 
 -- | Returns an event which can have multiple subscribers and a propagating procedure. The propagator
 -- is not allowed to be called outside of a frame (this is unenforced)!
@@ -141,7 +137,7 @@ managedSubscribersEvent = do
   ctrRef <- newIORef 0
   occRef <- newIORef Nothing
   pure
-    ( Event $ \propagate -> do
+    ( EventI $ \propagate -> do
         thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
         modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
         -- If occRef is already Just we have to propagate on subscribe

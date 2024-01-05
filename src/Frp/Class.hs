@@ -2,14 +2,10 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE DefaultSignatures #-}
-{-# LANGUAGE FunctionalDependencies #-}
 module Frp.Class where
 import Control.Monad.Fix
 import Data.Kind (Type)
 import Data.These
-import Data.Bool (bool)
-import Control.Monad.Trans
 import Data.Semigroup (Semigroup(..),First(..))
 import Data.List.NonEmpty (nonEmpty, NonEmpty)
 import qualified Data.Map as Map
@@ -24,13 +20,7 @@ import Data.Dependent.Map (DMap)
 import Control.Monad.Identity (Identity (..))
 import qualified Data.Dependent.Map as DMap
 
-class
-  ( MonadFix (Behavior t),
-    MonadFix (Moment t),
-    MonadMoment t (Moment t)
-  ) =>
-  Frp (t :: Type)
-  where
+class (MonadFix (Behavior t), MonadFix (Moment t)) => Frp (t :: Type) where
   data Behavior t :: Type -> Type
   data Event t :: Type -> Type
   type Moment t :: Type -> Type
@@ -39,31 +29,17 @@ class
   merge :: Event t a -> Event t b -> Event t (These a b)
   never :: Event t a
   switch :: Behavior t (Event t a) -> Event t a
-
-class MonadMoment t m | m -> t where
-  now :: m (Event t ())
-  default now :: (m ~ f m', MonadTrans f, Monad m', MonadMoment t m') => m (Event t ())
-  now = lift now
-  sample :: Behavior t a -> m a
-  default sample :: (m ~ f m', MonadTrans f, Monad m', MonadMoment t m') => Behavior t a -> m a
-  sample = lift . sample
-  hold :: a -> Event t a -> m (Behavior t a)
-  default hold :: (m ~ f m', MonadTrans f, Monad m', MonadMoment t m') => a -> Event t a -> m (Behavior t a)
-  hold a = lift . hold a
-  liftMoment :: Moment t a -> m a
-  default liftMoment :: (m ~ f m', MonadTrans f, Monad m', MonadMoment t m') => Moment t a -> m a
-  liftMoment = lift . liftMoment
+  now :: Moment t (Event t ())
+  sample :: Behavior t a -> Moment t a
+  hold :: a -> Event t a -> Moment t (Behavior t a)
 
 mapMoment :: Frp t => (a -> Moment t b) -> Event t a -> Event t b
 mapMoment f = mapMaybeMoment (fmap Just . f)
 
-filterE :: Frp t => (a -> Bool) -> Event t a -> Event t a
-filterE f = mapMaybeMoment (\a -> pure $ bool Nothing (Just a) (f a))
-
 instance Frp t => Functor (Event t) where
   fmap f = mapMaybeMoment (pure . Just . f)
 
-headE :: (Frp t, MonadMoment t m, Functor m, MonadFix m) => Event t a -> m (Event t a)
+headE :: (Frp t) => Event t a -> Moment t (Event t a)
 headE e = mfix $ fmap switch . hold e . fmap (const never)
 
 instance (Frp t, Semigroup a) => Semigroup (Event t a) where
@@ -91,16 +67,16 @@ infixl 4 <@
 tag :: Frp t => Behavior t b -> Event t a -> Event t b
 tag b = mapMoment $ \_ -> sample b
 
-accum :: (Frp t, MonadFix m, MonadMoment t m) => (a -> b -> a) -> a -> Event t b -> m (Behavior t a)
+accum :: (Frp t) => (a -> b -> a) -> a -> Event t b -> Moment t (Behavior t a)
 accum f a e = mfix $ \x -> hold a . mapMoment (\b -> (`f` b) <$> sample x) $ e
 
-accumE :: (Frp t, MonadFix m, MonadMoment t m) => (a -> b -> a) -> a -> Event t b -> m (Event t a)
+accumE :: (Frp t) => (a -> b -> a) -> a -> Event t b -> Moment t (Event t a)
 accumE f a e = mdo
   let e' = mapMoment (\q -> (`f` q) <$> sample b) e
   b <- hold a e'
   pure e'
 
-count :: (Frp t, MonadFix m, MonadMoment t m, Num n, Enum n) => Event t a -> m (Behavior t n)
+count :: (Frp t, Num n, Enum n) => Event t a -> Moment t (Behavior t n)
 count = accum (\a _ -> succ a) 0
 
 attachWith :: Frp t => (a1 -> a2 -> b) -> Behavior t a1 -> Event t a2 -> Event t b
@@ -112,7 +88,7 @@ leftmost = maybe never (fmap getFirst . sconcat . fmap (fmap First)) . nonEmpty
 mergeMap :: (Frp t, Ord k) => Map k (Event t a) -> Event t (Map k a)
 mergeMap = mconcat . fmap (\(t,e) -> Map.singleton t <$> e) . Map.toList
 
-switchHoldPromptly :: (Frp t, Monad m, MonadMoment t m) => Event t a -> Event t (Event t a) -> m (Event t a)
+switchHoldPromptly :: (Frp t) => Event t a -> Event t (Event t a) -> Moment t (Event t a)
 switchHoldPromptly ea0 eea = do
   bea <- hold ea0 eea
   let eLag = switch bea
@@ -163,7 +139,7 @@ instance (Frp t) => Applicative (Dynamic t) where
 instance (Frp t) => Monad (Dynamic t) where
   x >>= f =
     let d = fmap f x
-    in unsafeBuildDynamic 
+    in unsafeBuildDynamic
        (leftmost
          [ coincidence $ updated <$> updated d -- both
          , mapMoment (sample . current) $ updated d -- outer
@@ -173,27 +149,24 @@ instance (Frp t) => Monad (Dynamic t) where
   (>>) = (*>)
 
 
-foldDyn :: (Frp t, MonadFix m, MonadMoment t m) => (a -> b -> b) -> b -> Event t a -> m (Dynamic t b)
+foldDyn :: (Frp t) => (a -> b -> b) -> b -> Event t a -> Moment t (Dynamic t b)
 foldDyn = accumDyn . flip
 
-accumDyn :: (Frp t1, MonadFix m, MonadMoment t1 m) => (t2 -> t3 -> t2) -> t2 -> Event t1 t3 -> m (Dynamic t1 t2)
+accumDyn :: (Frp t1) => (t2 -> t3 -> t2) -> t2 -> Event t1 t3 -> Moment t1 (Dynamic t1 t2)
 accumDyn f = accumMaybeDyn $ \v o -> Just $ f v o
 
-accumMDyn :: (Frp t1, MonadFix m, MonadMoment t1 m) => (t2 -> t3 -> Moment t1 t2) -> t2 -> Event t1 t3 -> m (Dynamic t1 t2)
-accumMDyn f = accumMaybeMDyn $ \v o -> Just <$> f v o
-
-accumMaybeDyn :: (Frp t1, MonadFix m, MonadMoment t1 m) => (t2 -> t3 -> Maybe t2) -> t2 -> Event t1 t3 -> m (Dynamic t1 t2)
+accumMaybeDyn :: (Frp t) => (t2 -> t3 -> Maybe t2) -> t2 -> Event t t3 -> Moment t (Dynamic t t2)
 accumMaybeDyn f = accumMaybeMDyn $ \v o -> return $ f v o
 
-holdDyn :: (Functor m, MonadMoment t m) => a -> Event t a -> m (Dynamic t a)
+holdDyn :: Frp t => a -> Event t a -> Moment t (Dynamic t a)
 holdDyn v0 e = Dynamic e <$> hold v0 e
 
 accumMaybeMDyn
-  :: (Frp t, MonadFix m, MonadMoment t m)
+  :: (Frp t)
   => (a -> b -> Moment t (Maybe a))
   -> a
   -> Event t b
-  -> m (Dynamic t a)
+  -> Moment t (Dynamic t a)
 accumMaybeMDyn f z e = do
   rec let e' = flip mapMaybeMoment e $ \o -> do
             v <- sample $ current d'
@@ -204,9 +177,9 @@ accumMaybeMDyn f z e = do
 distributeListOverDyn :: Frp t => [Dynamic t a] -> Dynamic t [a]
 distributeListOverDyn = sequence
 
-buildDynamic :: (MonadMoment t m, Frp t, Monad m) => Moment t a -> Event t a -> m (Dynamic t a)
+buildDynamic :: (Frp t) => Moment t a -> Event t a -> Moment t (Dynamic t a)
 buildDynamic v0 e = do
-  i <- liftMoment v0
+  i <- v0
   Dynamic e <$> hold i e
 
 fan :: forall t k. (Frp t, GCompare k)
@@ -219,31 +192,5 @@ mergeList = mapMaybe nonEmpty . mconcat . fmap (fmap (:[]))
 fanMap :: (Frp t, Ord k) => Event t (Map k a) -> EventSelector t (Const2 k a)
 fanMap = fan . fmap mapToDMap
 
--- | An 'EventSelector' allows you to efficiently 'select' an 'Event' based on a
--- key.  This is much more efficient than filtering for each key with
--- 'mapMaybe'.
-newtype EventSelector t k = EventSelector
-  { -- | Retrieve the 'Event' for the given key.  The type of the 'Event' is
-    -- determined by the type of the key, so this can be used to fan-out
-    -- 'Event's whose sub-'Event's have different types.
-    --
-    -- Using 'EventSelector's and the 'fan' primitive is far more efficient than
-    -- (but equivalent to) using 'mapMaybe' to select only the relevant
-    -- occurrences of an 'Event'.
-    select :: forall a. k a -> Event t a
-  }
+newtype EventSelector t k = EventSelector { select :: forall a. k a -> Event t a }
 
-newtype EventSelectorG t k v = EventSelectorG
-  { -- | Retrieve the 'Event' for the given key.  The type of the 'Event' is
-    -- determined by the type of the key, so this can be used to fan-out
-    -- 'Event's whose sub-'Event's have different types.
-    --
-    -- Using 'EventSelector's and the 'fan' primitive is far more efficient than
-    -- (but equivalent to) using 'mapMaybe' to select only the relevant
-    -- occurrences of an 'Event'.
-    selectG :: forall a. k a -> Event t (v a)
-  }
-
--- | Efficiently select an 'Event' keyed on 'Int'. This is more efficient than manually
--- filtering by key.
-newtype EventSelectorInt t a = EventSelectorInt { selectInt :: Int -> Event t a }
