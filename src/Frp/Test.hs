@@ -24,15 +24,13 @@ import qualified Data.Map as Map
 import System.Exit
 import Data.Char (toUpper)
 import Data.Functor (void)
-import Data.Functor.Misc (Const2(..))
 import Data.IntSet (IntSet)
-import qualified Data.List.NonEmpty as NonEmpty
 
 newtype PlanImpl a where
   PlanImpl :: (StateT Schedule (Moment Impl) a) -> PlanImpl a
   deriving (Functor,Applicative,Monad,MonadFix)
 
-type Schedule = IntMap [IO ()]
+type Schedule = IntMap [EventTrigger]
 
 newtype PlanPure a = PlanPure (StateT IntSet (Moment (Pure Int)) a)
   deriving (Functor,Applicative,Monad,MonadFix)
@@ -59,7 +57,7 @@ instance TestPlan (Pure Int) PlanPure where
 
 runPlanImplE :: PlanImpl (Event Impl b) -> IO (IntMap b)
 runPlanImplE (PlanImpl x) = do
-  (e,s) <- unMomentImpl $ runStateT x mempty
+  (e,s) <- runMomentImpl $ runStateT x mempty
   readOcc <- subscribeEvent e
   catMaybes
     <$> traverse (\occs -> do
@@ -69,10 +67,10 @@ runPlanImplE (PlanImpl x) = do
 -- TODO: commonalities between runPlanImpl*
 runPlanImplB :: PlanImpl (Behavior Impl b) -> IO (IntMap b)
 runPlanImplB (PlanImpl x) = do
-  (b,s) <- unMomentImpl $ runStateT x mempty
+  (b,s) <- runMomentImpl $ runStateT x mempty
   traverse (\occs -> do
                performGC
-               runFrame occs (sample b))
+               runFrame occs (readBehavior b))
     (makeDense s)
 
 runPure :: PlanPure a -> (a, IntSet)

@@ -4,7 +4,7 @@
 {-# LANGUAGE TypeFamilies #-}
 
 module Frp.Impl
-(newEvent, subscribeEvent, runFrame, Impl, MomentImpl(..))
+(newEvent, subscribeEvent, runFrame, Impl, MomentImpl(..), EventTrigger, ReadTime, readBehavior)
 where
 
 import Prelude hiding (filter)
@@ -38,7 +38,7 @@ propagateRoot :: IO ()
   (eCached, doPropagate) <- managedSubscribersEvent
   pure (eCached, doPropagate (Just ()))
 
-newtype MomentImpl a = MomentImpl { unMomentImpl :: IO a }
+newtype MomentImpl a = MomentImpl { runMomentImpl :: IO a }
   deriving (Functor,Applicative,Monad,MonadFix, MonadIO)
 
 -- | 
@@ -59,14 +59,16 @@ instance Frp Impl where
   never = undefined <$ filter (const False) rootTickE
 
   mapMaybeMoment :: (a -> Moment Impl (Maybe b)) -> Event Impl a -> Event Impl b
-  mapMaybeMoment f e = cacheEvent $ EventI $ \propagate -> subscribe e $ propagate <=< fmap join . mapM (unMomentImpl . f)
+  mapMaybeMoment f e = cacheEvent $ EventI $ \propagate ->
+    subscribe e $ propagate <=< fmap join . mapM (runMomentImpl . f)
 
   -- When the outer event is known to not have an occurrence, propagate non-occurrence. Otherwise,
   -- subscribe to the inner occurrence and queue-up its unsubscribe action.  It's possible to write
   -- the implementation so that unsubscribing happens immediately but using the queue made things
   -- more succinct.
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
-  coincidence e = cacheEvent $ EventI $ \propagate -> subscribe e $ maybe (propagate Nothing) (addToEnvQueue toClearQueueRef <=< (`subscribe` propagate))
+  coincidence e = cacheEvent $ EventI $ \propagate ->
+    subscribe e $ maybe (propagate Nothing) (addToEnvQueue toClearQueueRef <=< (`subscribe` propagate))
 
   -- Subscribe to both merge inputs and cache the occurrences. When both (non-)occurrences are
   -- known, propagate and clear the caches.
@@ -98,6 +100,7 @@ instance Frp Impl where
       <=< runReaderT switchParent . Just
       $ readIORef maybeUnsubscribeInnerERef >>= mapM_ (>> (f >>= writeIORef maybeUnsubscribeInnerERef))
     pure $ readIORef maybeUnsubscribeInnerERef >>= mapM_ (>> writeIORef maybeUnsubscribeInnerERef Nothing)
+
   -- Hold returns a behavior which is initialized at behavior init time and changes at behavior
   -- assignment time. Whenever the behavior is read an invalidator action can be added which is
   -- called when the behavior changes.
@@ -159,32 +162,37 @@ cacheEvent e = unsafePerformIO $ do
   void . subscribe e $ doPropagate
   pure eCached
 
-type MakeEventTrigger a = (a -> EventTrigger)
-type EventTrigger = IO ()
+newtype EventTrigger = EventTrigger { runEventTrigger :: IO () }
 
 -- | Create a new event. Returns a "make trigger" function to which you can pass an occurrence value
 -- and obtain an 'EventTrigger' for use with 'runFrame', and the new event.
-newEvent :: IO (MakeEventTrigger a, Event Impl a)
+newEvent :: IO (a -> EventTrigger, Event Impl a)
 newEvent = do
   occRef <- newIORef Nothing -- Root event (non-)occurrence is always "known", thus Maybe a
-  pure (writeAndScheduleClear occRef, mapMaybeMoment (const (MomentImpl $ readIORef occRef)) rootTickE)
+  pure (EventTrigger . writeAndScheduleClear occRef, mapMaybeMoment (const (MomentImpl $ readIORef occRef)) rootTickE)
 
 -- | Subscribe to an event to obtain an "read occurrence" action which will contain the event
 -- occurrence value when read inside the 'program' argument of 'runFrame'.
-subscribeEvent :: forall a. Event Impl a -> IO (MomentImpl (Maybe a))
+subscribeEvent :: forall a. Event Impl a -> IO (ReadTime (Maybe a))
 subscribeEvent e = do
   occRef :: IORef (Maybe (Maybe a)) <- newIORef Nothing
   _ <- subscribe e $ writeAndScheduleClear occRef
-  pure $ MomentImpl $ fromMaybe (error "Occurrence read outside of runFrame?") <$> readIORef occRef
+  pure $ ReadTime $ fromMaybe (error "Occurrence read outside of runFrame?") <$> readIORef occRef
+
+newtype ReadTime a = ReadTime { runReadTime :: IO a }
+  deriving (Functor,Applicative,Monad)
+
+readBehavior :: Behavior Impl a -> ReadTime a
+readBehavior (BehaviorI b) = ReadTime $ runReaderT b Nothing
 
 -- | Inside the second argument you can read Behaviors and read event occurrences after subscribing
 -- to an event.
-runFrame :: [EventTrigger] -> MomentImpl a -> IO a
-runFrame triggers (MomentImpl program) = do
+runFrame :: [EventTrigger] -> ReadTime a -> IO a
+runFrame triggers program = do
   let (Env { toClearQueueRef, behaviorInitsRef, behaviorAssignmentsRef }) = theEnv
-  sequence_ triggers
+  mapM_ runEventTrigger triggers
   propagateRoot
-  res <- program
+  res <- runReadTime program
   fix $ \runHoldInits -> do
     inits <- readIORef behaviorInitsRef
     unless (null inits) $ do
