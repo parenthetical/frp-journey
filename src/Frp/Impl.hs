@@ -23,7 +23,7 @@ import Witherable
 
 data Impl
 
-type Subscriber a = Maybe a -> IO ()
+type Propagator a = Maybe a -> IO ()
 type Unsubscribe = IO ()
 type Invalidator = IO ()
 
@@ -42,7 +42,7 @@ instance Frp Impl where
   -- Events are subscribed to with a callback called whenever the event has a known
   -- (non)-occurrence. Subscribing to an event returns an unsubscribe action. Unsubscribing
   -- immediately stops any callbacks from happening.
-  newtype Event Impl a = EventI { subscribe :: Subscriber a -> IO Unsubscribe }
+  newtype Event Impl a = EventI { subscribe :: Propagator a -> IO Unsubscribe }
   -- Behaviors are sampling functions which are passed an optional invalidator. This invalidator
   -- is run when the Behavior's value might change (but it could also stay the same).
   newtype Behavior Impl a = BehaviorI (ReaderT (Maybe Invalidator) IO a)
