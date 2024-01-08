@@ -57,7 +57,7 @@ instance TestPlan (Pure Int) PlanPure where
 
 runPlanImplE :: PlanImpl (Event Impl b) -> IO (IntMap b)
 runPlanImplE (PlanImpl x) = do
-  (e,s) <- runMomentImpl $ runStateT x mempty
+  (e,s) <- runStateT x mempty
   readOcc <- subscribeEvent e
   catMaybes
     <$> traverse (\occs -> do
@@ -67,7 +67,7 @@ runPlanImplE (PlanImpl x) = do
 -- TODO: commonalities between runPlanImpl*
 runPlanImplB :: PlanImpl (Behavior Impl b) -> IO (IntMap b)
 runPlanImplB (PlanImpl x) = do
-  (b,s) <- runMomentImpl $ runStateT x mempty
+  (b,s) <- runStateT x mempty
   traverse (\occs -> do
                performGC
                runFrame occs (readBehavior b))

@@ -4,7 +4,7 @@
 {-# LANGUAGE TypeFamilies #-}
 
 module Frp.Impl
-(newEvent, subscribeEvent, runFrame, Impl, MomentImpl(..), EventTrigger, ReadTime, readBehavior)
+(newEvent, subscribeEvent, runFrame, Impl, EventTrigger, ReadTime, readBehavior)
 where
 
 import Prelude hiding (filter)
@@ -14,12 +14,11 @@ import Control.Monad
 import Data.IORef
 import Data.Align (Semialign(..))
 import Data.These
-import Data.Maybe (isJust, fromMaybe)
+import Data.Maybe (fromMaybe)
 import System.IO.Unsafe ( unsafePerformIO, unsafeInterleaveIO )
 import qualified Data.IntMap as IntMap
 import Control.Monad.Reader (ReaderT(..))
 import GHC.IO (evaluate)
-import Control.Monad.IO.Class (MonadIO)
 import Witherable
 
 data Impl
@@ -38,9 +37,6 @@ propagateRoot :: IO ()
   (eCached, doPropagate) <- managedSubscribersEvent
   pure (eCached, doPropagate (Just ()))
 
-newtype MomentImpl a = MomentImpl { runMomentImpl :: IO a }
-  deriving (Functor,Applicative,Monad,MonadFix, MonadIO)
-
 -- | 
 instance Frp Impl where
   -- Events are subscribed to with a callback called whenever the event has a known
@@ -52,7 +48,7 @@ instance Frp Impl where
   newtype Behavior Impl a = BehaviorI (ReaderT (Maybe Invalidator) IO a)
     deriving (Functor, Applicative, Monad, MonadFix)
 
-  type Moment Impl = MomentImpl
+  type Moment Impl = IO
 
   -- Never is implemented by filtering out all occurences from the root event.
   never :: Event Impl a
@@ -60,7 +56,7 @@ instance Frp Impl where
 
   mapMaybeMoment :: (a -> Moment Impl (Maybe b)) -> Event Impl a -> Event Impl b
   mapMaybeMoment f e = cacheEvent $ EventI $ \propagate ->
-    subscribe e $ propagate <=< fmap join . mapM (runMomentImpl . f)
+    subscribe e $ propagate <=< fmap join . mapM f
 
   -- When the outer event is known to not have an occurrence, propagate non-occurrence. Otherwise,
   -- subscribe to the inner occurrence and queue-up its unsubscribe action.  It's possible to write
@@ -105,7 +101,7 @@ instance Frp Impl where
   -- assignment time. Whenever the behavior is read an invalidator action can be added which is
   -- called when the behavior changes.
   hold :: a -> Event Impl a -> Moment Impl (Behavior Impl a)
-  hold v0 e = MomentImpl $ do
+  hold v0 e = do
     invsRef <- newIORef [] -- The list of invalidators that have to run whenever the result behavior
                            -- changes.
     valRef <- newIORef v0
@@ -123,7 +119,7 @@ instance Frp Impl where
   -- last moment by which the sample would need to be forced is behavior invalidation time, but here
   -- I've forced the evaluation at the next behavior init time.
   sample :: Behavior Impl a -> Moment Impl a
-  sample (BehaviorI b) = MomentImpl $ do
+  sample (BehaviorI b) = do
     res <- unsafeInterleaveIO $ runReaderT b Nothing
     addToEnvQueue behaviorInitsRef $ void . evaluate $ res
     pure res
@@ -166,7 +162,7 @@ newtype EventTrigger = EventTrigger { runEventTrigger :: IO () }
 newEvent :: IO (a -> EventTrigger, Event Impl a)
 newEvent = do
   occRef <- newIORef Nothing -- Root event (non-)occurrence is always "known", thus Maybe a
-  pure (EventTrigger . writeAndScheduleClear occRef, mapMaybeMoment (const (MomentImpl $ readIORef occRef)) rootTickE)
+  pure (EventTrigger . writeAndScheduleClear occRef, mapMaybeMoment (const (readIORef occRef)) rootTickE)
 
 -- | Subscribe to an event to obtain an "read occurrence" action which will contain the event
 -- occurrence value when read inside the 'program' argument of 'runFrame'.
