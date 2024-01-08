@@ -24,7 +24,7 @@ import Witherable
 data Impl
 
 type Propagator a = Maybe a -> IO ()
-type Unsubscribe = IO ()
+type Unsubscriber = IO ()
 type Invalidator = IO ()
 
 -- | The root event 'rootTickE' has an occurrence whenever any event might have one.
@@ -42,7 +42,7 @@ instance Frp Impl where
   -- Events are subscribed to with a callback called whenever the event has a known
   -- (non)-occurrence. Subscribing to an event returns an unsubscribe action. Unsubscribing
   -- immediately stops any callbacks from happening.
-  newtype Event Impl a = EventI { subscribe :: Propagator a -> IO Unsubscribe }
+  newtype Event Impl a = EventI { subscribe :: Propagator a -> IO Unsubscriber }
   -- Behaviors are sampling functions which are passed an optional invalidator. This invalidator
   -- is run when the Behavior's value might change (but it could also stay the same).
   newtype Behavior Impl a = BehaviorI (ReaderT (Maybe Invalidator) IO a)
@@ -72,7 +72,7 @@ instance Frp Impl where
   merge a b = cacheEvent $ EventI $ \propagate -> do
     aOccRef <- newIORef Nothing
     bOccRef <- newIORef Nothing
-    let doSub :: forall c. IORef (Maybe (Maybe c)) -> Event Impl c -> IO Unsubscribe
+    let doSub :: forall c. IORef (Maybe (Maybe c)) -> Event Impl c -> IO Unsubscriber
         doSub occRef e = subscribe e $ \occ -> do
             writeIORef occRef . Just $ occ
             -- Check if we have both inputs when any input is called. If yes, clear caches and
