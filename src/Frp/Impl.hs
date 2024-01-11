@@ -20,6 +20,7 @@ import qualified Data.IntMap as IntMap
 import Control.Monad.Reader (ReaderT(..))
 import GHC.IO (evaluate)
 import Witherable
+import Data.Foldable (for_)
 
 data Impl
 
@@ -91,11 +92,17 @@ instance Frp Impl where
   -- is Just-valued still.
   switch :: Behavior Impl (Event Impl a) -> Event Impl a
   switch (BehaviorI switchParent) = cacheEvent $ EventI $ \propagate -> mdo
-    maybeUnsubscribeInnerERef <- newIORef <=< fix $ \f ->
-      fmap Just . (`subscribe` propagate)
-      <=< runReaderT switchParent . Just
-      $ readIORef maybeUnsubscribeInnerERef >>= mapM_ (>> (f >>= writeIORef maybeUnsubscribeInnerERef))
-    pure $ readIORef maybeUnsubscribeInnerERef >>= mapM_ (>> writeIORef maybeUnsubscribeInnerERef Nothing)
+    let unsubscribeAndSetUnsubscriberWith :: IO (Maybe (IO ())) -> IO ()
+        unsubscribeAndSetUnsubscriberWith f = do
+          maybeUnsubscribeInner <- readIORef maybeUnsubscribeInnerERef
+          for_ maybeUnsubscribeInner $ \unsubscribe -> do
+            unsubscribe
+            writeIORef maybeUnsubscribeInnerERef =<< f
+    maybeUnsubscribeInnerERef :: IORef (Maybe Unsubscriber) <-
+      newIORef <=< fix $ \subscribeAndResetOnInvalidate ->
+        fmap Just . (`subscribe` propagate) <=< runReaderT switchParent . Just
+        $ unsubscribeAndSetUnsubscriberWith subscribeAndResetOnInvalidate
+    pure $ unsubscribeAndSetUnsubscriberWith (pure Nothing)
 
   -- Hold returns a behavior which is initialized at behavior init time and changes at behavior
   -- assignment time. Whenever the behavior is read an invalidator action can be added which is
