@@ -149,7 +149,10 @@ managedSubscribersEvent = do
         -- If occRef is already Just we have to propagate on subscribe
         -- because the subscription on e has already propagated:
         mapM_ propagate =<< readIORef occRef
-        pure $ modifyIORef subscribersRef (IntMap.delete thisSubId)
+        pure $ do
+          old <- readIORef subscribersRef
+          unless (IntMap.member thisSubId old) $ error "managedSubscribers unsubscribed twice"
+          modifyIORef subscribersRef (IntMap.delete thisSubId)
     , \occ -> do
         writeAndScheduleClear occRef occ
         mapM_ ($ occ) =<< readIORef subscribersRef
@@ -206,11 +209,18 @@ runFrame triggers program = do
     >>= mapM_ (\(BehaviorAssignment valRef a invalidatorsRef) -> do
                   writeIORef valRef a
                   atomicModifyIORef invalidatorsRef ([],) >>= sequence_)
+  flip unless (error "queues were not empty after runFrame")
+    . and =<< sequence [ null <$> readIORef behaviorInitsRef
+                       , null <$> readIORef toClearQueueRef
+                       , null <$> readIORef behaviorAssignmentsRef
+                       ]
   pure res
 
 -- | Write a value to an event occurrence cache/IORef and schedule it to be cleared.
 writeAndScheduleClear :: IORef (Maybe a) -> a -> IO ()
 writeAndScheduleClear occRef a = do
+  prev <- readIORef occRef
+  when (isJust prev) $ error "occRef written twice---loop?"
   writeIORef occRef (Just a)
   addToEnvQueue toClearQueueRef $ writeIORef occRef Nothing
 
