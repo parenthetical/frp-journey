@@ -169,7 +169,9 @@ newtype EventTrigger = EventTrigger { runEventTrigger :: IO () }
 newEvent :: IO (a -> EventTrigger, Event Impl a)
 newEvent = do
   occRef <- newIORef Nothing -- Root event (non-)occurrence is always "known", thus Maybe a
-  pure (EventTrigger . writeAndScheduleClear occRef, mapMaybeMoment (const (readIORef occRef)) rootTickE)
+  pure ( EventTrigger . writeAndScheduleClear occRef
+       , mapMaybeMoment (const (readIORef occRef)) rootTickE
+       )
 
 -- | Subscribe to an event to obtain an "read occurrence" action which will contain the event
 -- occurrence value when read inside the 'program' argument of 'runFrame'.
