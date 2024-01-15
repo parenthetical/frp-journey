@@ -14,7 +14,7 @@ import Control.Monad
 import Data.IORef
 import Data.Align (Semialign(..))
 import Data.These
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import System.IO.Unsafe ( unsafePerformIO, unsafeInterleaveIO )
 import qualified Data.IntMap as IntMap
 import Control.Monad.Reader (ReaderT(..))
