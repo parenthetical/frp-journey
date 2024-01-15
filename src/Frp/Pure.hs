@@ -1,4 +1,11 @@
 {-# LANGUAGE TypeFamilies #-}
+{-|
+Description: A pure (non-IO) implementation of the Frp interface.
+
+In this pure implementation of 'Frp.Class.Frp', events, Behaviors, and Moment are implemented as
+functions of time.  The implementation avoids referencing time whenever possible to make it clear
+which functions depend only on some "current time" or the past as well.
+-}
 module Frp.Pure where
 
 import Frp.Class

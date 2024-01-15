@@ -2,6 +2,9 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE RankNTypes #-}
+{-|
+Description: FRP interface definition and utility functions.
+-}
 module Frp.Class where
 
 import Control.Monad.Fix
