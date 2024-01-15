@@ -21,7 +21,7 @@ instance (Ord t, Enum t) => Frp (Pure t) where
   merge a b = EventP $ align <$> occurs a <*> occurs b
   never = EventP $ pure Nothing
   switch = EventP . (occurs <=< sample)
-  now t = EventP $ guard . (t ==)
+  now = fmap (EventP . fmap guard) (==)
   sample = at
   hold a e from = BehaviorP $ \t ->
     if t <= from
