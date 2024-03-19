@@ -21,7 +21,7 @@ the 'behaviorInitsRef' and 'behaviorAssignmentsRef' queues).
 After graph traversal, the various queues are processed and emptied.
 -}
 module Frp.Impl
-(newEvent, subscribeEvent, runFrame, Impl, EventTrigger, ReadTime, readBehavior)
+(newEvent, subscribeEvent, runFrame, Impl, EventTrigger, ReadTime, readBehavior, unsubscribe)
 where
 
 import Prelude hiding (filter)
@@ -38,12 +38,23 @@ import Control.Monad.Reader (ReaderT(..))
 import GHC.IO (evaluate)
 import Witherable
 import Data.Foldable (for_)
+import System.Mem.Weak (deRefWeak, mkWeakPtr, finalize)
+import GHC.Base (Any)
+import Unsafe.Coerce (unsafeCoerce)
+import GHC.Weak (Weak)
 
 data Impl
 
 type Propagator a = Maybe a -> IO ()
-type Unsubscriber = IO ()
+
+data Subscription = Subscription { unsubscribe :: IO (), _keepAlive :: {-# NOUNPACK #-} Any }
+
+instance Semigroup Subscription where
+  Subscription a a' <> Subscription b b' = Subscription (a >> b) (unsafeCoerce (a',b'))
+
 type Invalidator = IO ()
+
+type SubscribersRef a = IORef (IntMap.IntMap (Weak (IORef (Propagator a))))
 
 -- | The root event 'rootTickE' has an occurrence whenever any event might have one.
 {-# NOINLINE rootTickE #-}
@@ -51,20 +62,27 @@ rootTickE :: Event Impl ()
 -- | The 'propagateRoot' action causes the root event to propagate with a unit-valued occurrence.
 {-# NOINLINE propagateRoot #-}
 propagateRoot :: IO ()
-(rootTickE, propagateRoot) = unsafePerformIO $ do
-  (eCached, doPropagate) <- managedSubscribersEvent
-  pure (eCached, doPropagate (Just ()))
+_rootSubscribersRef :: SubscribersRef ()
+(rootTickE, propagateRoot, _rootSubscribersRef) = unsafePerformIO $ do
+  (eCached, doPropagate, subscribersRef) <- managedSubscribersEvent $ do
+    putStrLn "root init"
+    pure $ putStrLn "root de-init"
+  pure (eCached, doPropagate (Just ()), subscribersRef)
 
 -- | 
 instance Frp Impl where
-  -- Events are subscribed to with a callback ('Propagator'), called whenever the event has a known
-  -- (non)-occurrence. Subscribing to an event returns an unsubscribe action. Unsubscribing stops
-  -- callbacks from happening. This unsubscribing might be immediate or only happen when
-  -- 'postTraversalQueueRef' is processed.
-  newtype Event Impl a = EventI { subscribe :: Propagator a -> IO Unsubscriber }
-  -- Behaviors are sampling functions which are passed an optional invalidator. This invalidator
-  -- is run when the Behavior's value might change (but it could also stay the same).
-  newtype Behavior Impl a = BehaviorI (ReaderT (Maybe Invalidator) IO a)
+  -- Events are subscribed to with a callback called whenever the event has a known
+  -- (non)-occurrence. Subscribing to an event returns a Subscription value which needs to be
+  -- retained in its entirety to keep the callback being called on an occurrences unsubscribing
+  -- stops callbacks from happening. It is not well defined wether you might still receive one for
+  -- the current time after unsubscribing.
+  newtype Event Impl a = EventI { subscribe :: Propagator a -> IO Subscription }
+  -- Behaviors are sampling functions which are passed an optional invalidator. This invalidator is
+  -- run when the Behavior's value might change (but it could also stay the same).  Behaviors also
+  -- implement a Writer Monad via a list-valued IORef. This serves to keep the subscriptions to the
+  -- events which influence the behavior's value alive. Pass in an IORef and keep it alive if you
+  -- depend on receiving updates from a Behavior (via it calling your invalidator).
+  newtype Behavior Impl a = BehaviorI (ReaderT (Maybe (Weak Invalidator, IORef [IORef (Maybe Subscription)])) IO a)
     deriving (Functor, Applicative, Monad, MonadFix)
 
   type Moment Impl = IO
@@ -83,7 +101,7 @@ instance Frp Impl where
   -- more succinct.
   coincidence :: Event Impl (Event Impl a) -> Event Impl a
   coincidence e = cacheEvent $ EventI $ \propagate ->
-    subscribe e $ maybe (propagate Nothing) (addToEnvQueue postTraversalQueueRef <=< (`subscribe` propagate))
+    subscribe e $ maybe (propagate Nothing) (addToEnvQueue postTraversalQueueRef . unsubscribe <=< (`subscribe` propagate))
 
   -- Subscribes to both merge inputs and cache the occurrences. When both (non-)occurrences are
   -- known, propagate and clear the caches. Unsubscribing unsubscribes from both input events.
@@ -91,7 +109,7 @@ instance Frp Impl where
   merge a b = cacheEvent $ EventI $ \propagate -> do
     aOccRef <- newIORef Nothing
     bOccRef <- newIORef Nothing
-    let doSub :: forall c. IORef (Maybe (Maybe c)) -> Event Impl c -> IO Unsubscriber
+    let doSub :: forall c. IORef (Maybe (Maybe c)) -> Event Impl c -> IO Subscription
         doSub occRef e = subscribe e $ \occ -> do
             writeIORef occRef . Just $ occ
             -- Check if we have both inputs when any input is called. If yes, clear caches and
@@ -101,41 +119,53 @@ instance Frp Impl where
                       writeIORef bOccRef Nothing
                       propagate occRes)
               =<< liftA2 align <$> readIORef aOccRef <*> readIORef bOccRef
-    (>>) <$> doSub aOccRef a <*> doSub bOccRef b
+    (<>) <$> doSub aOccRef a <*> doSub bOccRef b
 
-  -- Switch keeps the unsubscriber to the inner event in an 'IORef (Maybe Unsubscriber)'. As long as
-  -- the result event of switch is subscribed to, the IORef is kept as Just Unsubscriber. On
-  -- unsubscribing it's set to Nothing. When switchParent's invalidator runs, the old inner event is
-  -- unsubscribed from and the IORef set to the new one. The invalidator only runs if the IORef is
-  -- Just-valued still, so that unsubscribing from the resulting switch event stops new
-  -- subscriptions (and semantics-breaking propagations) from happening.
+{-
+  Switch keeps the subscription to the inner event in an IORef (Maybe Subscription). As long as the
+  result event of switch is subscribed to the IORef is kept as Just; on unsubscribing it's set to
+  Nothing. When switchParent's invalidator is run the old inner event is unsubscribed from and the
+  IORef set to the new one. The invalidator only runs if the IORef is Just-valued still, so that
+  unsubscribing from the resulting switch event stops new subscriptions (and semantics-breaking
+  propagations) from happening.
+-}
   switch :: Behavior Impl (Event Impl a) -> Event Impl a
   switch (BehaviorI switchParent) = cacheEvent $ EventI $ \propagate -> mdo
-    let unsubscribeAndSetUnsubscriberWith :: IO (Maybe (IO ())) -> IO ()
-        unsubscribeAndSetUnsubscriberWith f = do
-          maybeUnsubscribeInner <- readIORef maybeUnsubscribeInnerERef
-          for_ maybeUnsubscribeInner $ \unsubscribe -> do
-            unsubscribe
-            writeIORef maybeUnsubscribeInnerERef =<< f
-    maybeUnsubscribeInnerERef :: IORef (Maybe Unsubscriber) <-
-      newIORef <=< fix $ \subscribeAndResetOnInvalidate ->
-        fmap Just . (`subscribe` propagate) <=< runReaderT switchParent . Just
-        $ unsubscribeAndSetUnsubscriberWith subscribeAndResetOnInvalidate
-    pure $ unsubscribeAndSetUnsubscriberWith (pure Nothing)
+    switchParentParentEventsRef <- newIORef []
+    maybeUnsubscribeInnerERef <- newIORef <=< fix $ \subscribeAndResetOnInvalidate -> do
+      weakInvalidator :: Weak Invalidator <- mkWeakPtr
+        (readIORef maybeUnsubscribeInnerERef
+              >>= mapM_ ((>> (do writeIORef switchParentParentEventsRef []
+                                 writeIORef maybeUnsubscribeInnerERef =<< subscribeAndResetOnInvalidate))
+                         . unsubscribe))
+        Nothing
+      fmap Just . (`subscribe` propagate)
+        <=< runReaderT switchParent . Just
+        $ ( weakInvalidator
+          , switchParentParentEventsRef
+          )
+    pure $ Subscription
+           (readIORef maybeUnsubscribeInnerERef
+            >>= mapM_ ((>> (writeIORef switchParentParentEventsRef [] -- TODO: repeated above -- TODO: invent subscribing/unsubscribing to Behavior functions?
+                        >> writeIORef maybeUnsubscribeInnerERef Nothing))
+                       . unsubscribe))
+           (unsafeCoerce (maybeUnsubscribeInnerERef, switchParentParentEventsRef))
 
   -- Hold returns a behavior which is initialized at behavior init time and changes at behavior
   -- assignment time. Whenever the behavior is sampled an invalidator action can be added which is
   -- called when the behavior changes. This is used to implement 'switch'.
   hold :: a -> Event Impl a -> Moment Impl (Behavior Impl a)
   hold v0 e = do
-    invsRef <- newIORef [] -- The list of invalidators that have to run whenever the result behavior
-                           -- changes.
+    invsRef :: IORef [Weak Invalidator] <- newIORef [] -- The list of invalidators that have to run whenever the result behavior changes.
     valRef <- newIORef v0
     -- Make sure not to touch 'e' eagerly, instead wait for Behavior init time.
-    addToEnvQueue behaviorInitsRef $ void $ subscribe e $
+    maybeSubscribedRef <- newIORef Nothing
+    addToEnvQueue behaviorInitsRef $ writeIORef maybeSubscribedRef . Just <=< subscribe e $
       mapM_ (\a -> addToEnvQueue behaviorAssignmentsRef $ BehaviorAssignment valRef a invsRef)
-    pure $ BehaviorI $ ReaderT $ \invalidator -> do
-      mapM_ (modifyIORef invsRef . (:)) invalidator
+    pure $ BehaviorI $ ReaderT $ \maybeInvalidatorParents -> do
+      forM_ maybeInvalidatorParents $ \(invalidator, parentsRef) -> do
+        modifyIORef invsRef . (:) $ invalidator
+        modifyIORef parentsRef . (:) $ maybeSubscribedRef -- TODO: Reflex uses a tree data type for sharing of parents
       readIORef valRef
 
   now :: Moment Impl (Event Impl ())
@@ -147,42 +177,59 @@ instance Frp Impl where
   sample :: Behavior Impl a -> Moment Impl a
   sample (BehaviorI b) = do
     res <- unsafeInterleaveIO $ runReaderT b Nothing
-    addToEnvQueue behaviorInitsRef $ void . evaluate $ res
+    weakRes <- mkWeakPtr res Nothing
+    addToEnvQueue behaviorInitsRef $ mapM_ evaluate =<< deRefWeak weakRes
     pure res
 
 -- | An update to a behavior's cached value.
 data BehaviorAssignment where
-  BehaviorAssignment :: IORef a -> a -> IORef [Invalidator] -> BehaviorAssignment
+  BehaviorAssignment :: IORef a -> a -> IORef [Weak Invalidator] -> BehaviorAssignment
 
 
--- | Returns a cached event which can have multiple subscribers and a propagating/cache update
--- procedure. The propagator is not allowed to be called outside of a frame (this is unenforced)!
-managedSubscribersEvent :: IO (Event Impl a, Maybe a -> IO ())
-managedSubscribersEvent = do
+-- | Returns an event which can have multiple subscribers and a propagating/cache update procedure. The propagator
+-- is not allowed to be called outside of a frame (this is unenforced)!
+managedSubscribersEvent :: IO (IO ()) -> IO (Event Impl a, Maybe a -> IO (), SubscribersRef a)
+managedSubscribersEvent subscribe = do
   subscribersRef <- newIORef mempty
   ctrRef <- newIORef 0
   occRef <- newIORef Nothing
+  let unitializedVal = error "managedSubscribersEvent: unsubscribeRef unitialized"
+  unsubscribeRef <- newIORef unitializedVal
   pure
     ( EventI $ \propagate -> do
+        oldSubscribers <- readIORef subscribersRef
+        when (IntMap.null oldSubscribers) $ do
+          writeIORef unsubscribeRef =<< subscribe
         thisSubId <- atomicModifyIORef ctrRef (\i -> (succ i, i))
-        modifyIORef subscribersRef $ IntMap.insert thisSubId propagate
-        -- If occRef is already Just we have to propagate on subscribe
-        -- because the subscription on e has already propagated:
-        mapM_ propagate =<< readIORef occRef
-        pure $ do
+        propagateRef <- newIORef propagate
+        propagateRefWeak <- mkWeakIORef propagateRef $ do
           old <- readIORef subscribersRef
           unless (IntMap.member thisSubId old) $ error "managedSubscribers unsubscribed twice"
           modifyIORef subscribersRef (IntMap.delete thisSubId)
+          isEmpty <- IntMap.null <$> readIORef subscribersRef
+          when isEmpty $ do
+            join $ readIORef unsubscribeRef
+            writeIORef unsubscribeRef unitializedVal
+        modifyIORef subscribersRef . IntMap.insert thisSubId $ propagateRefWeak
+        -- If occRef is already Just we have to propagate on subscribe
+        -- because the subscription on e has already propagated:
+        mapM_ propagate =<< readIORef occRef
+        pure $ Subscription (finalize propagateRefWeak) (unsafeCoerce propagateRef)
     , \occ -> do
-        writeAndScheduleClear occRef occ
-        mapM_ ($ occ) =<< readIORef subscribersRef
+        writeAndScheduleClear "managedSubscribersEvent" occRef occ
+        mapM_ (\x -> do
+                  xm <- deRefWeak x
+                  for_ xm $ \y -> do
+                    prop <- readIORef y
+                    prop occ)
+          =<< readIORef subscribersRef
+    , subscribersRef
     )
 
 -- | Cache event occurrences.
 cacheEvent :: forall a. Event Impl a -> Event Impl a
-cacheEvent e = unsafePerformIO $ do
-  (eCached, doPropagate) <- managedSubscribersEvent
-  void . subscribe e $ doPropagate
+cacheEvent e = unsafePerformIO $ mdo
+  ~(eCached, doPropagate, _) <- managedSubscribersEvent . fmap unsubscribe $ subscribe e doPropagate
   pure eCached
 
 -- | For use in 'runFrame'.
@@ -193,17 +240,19 @@ newtype EventTrigger = EventTrigger { runEventTrigger :: IO () }
 newEvent :: IO (a -> EventTrigger, Event Impl a)
 newEvent = do
   occRef <- newIORef Nothing -- Root event (non-)occurrence is always "known", thus Maybe a
-  pure ( EventTrigger . writeAndScheduleClear occRef
+  pure ( EventTrigger . writeAndScheduleClear "newEvent" occRef
        , mapMaybeMoment (const (readIORef occRef)) rootTickE
        )
 
 -- | Subscribe to an event to obtain a "read occurrence" action which will contain the event
 -- occurrence value when read inside the 'program' argument of 'runFrame'.
-subscribeEvent :: forall a. Event Impl a -> IO (ReadTime (Maybe a))
+subscribeEvent :: forall a. Event Impl a -> IO (ReadTime (Maybe a), Subscription)
 subscribeEvent e = do
   occRef :: IORef (Maybe (Maybe a)) <- newIORef Nothing
-  _ <- subscribe e $ writeAndScheduleClear occRef
-  pure $ ReadTime $ fromMaybe (error "Occurrence read outside of runFrame?") <$> readIORef occRef
+  unsubscribe <- subscribe e $ writeAndScheduleClear "subscribeEvent" occRef
+  pure ( ReadTime $ fromMaybe (error "Occurrence read outside of runFrame?") <$> readIORef occRef
+       , unsubscribe
+       )
 
 -- | For use in obtaining Event and Behavior values in 'runFrame'.
 newtype ReadTime a = ReadTime { runReadTime :: IO a }
@@ -236,7 +285,7 @@ runFrame triggers program = do
   atomicModifyIORef behaviorAssignmentsRef ([],)
     >>= mapM_ (\(BehaviorAssignment valRef a invalidatorsRef) -> do
                   writeIORef valRef a
-                  atomicModifyIORef invalidatorsRef ([],) >>= sequence_)
+                  atomicModifyIORef invalidatorsRef ([],) >>= mapM_ (sequence_ <=< deRefWeak))
   flip unless (error "queues were not empty after runFrame")
     . and =<< sequence [ null <$> readIORef behaviorInitsRef
                        , null <$> readIORef postTraversalQueueRef
@@ -245,10 +294,10 @@ runFrame triggers program = do
   pure res
 
 -- | Write a value to an event occurrence cache/IORef and schedule it to be cleared.
-writeAndScheduleClear :: IORef (Maybe a) -> a -> IO ()
-writeAndScheduleClear occRef a = do
+writeAndScheduleClear :: String -> IORef (Maybe a) -> a -> IO ()
+writeAndScheduleClear name occRef a = do
   prev <- readIORef occRef
-  when (isJust prev) $ error "occRef written twice---loop?"
+  when (isJust prev) $ error $ name <> ": occRef written twice---loop?"
   writeIORef occRef (Just a)
   addToEnvQueue postTraversalQueueRef $ writeIORef occRef Nothing
 

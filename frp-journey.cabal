@@ -78,7 +78,8 @@ library
                       containers,
                       mtl,
                       witherable,
-                      transformers
+                      transformers,
+                      primitive
 
     -- Directories containing source files.
     hs-source-dirs:   src

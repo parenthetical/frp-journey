@@ -12,12 +12,11 @@ import Data.Kind (Type)
 import Control.Monad.State
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
-import System.Mem (performGC)
 import Witherable (catMaybes)
 import Frp.Pure
 import Data.Bifunctor (first)
 import qualified Data.IntSet as IntSet
-import Control.Monad.Fix (MonadFix)
+import Control.Monad.Fix (MonadFix, mfix)
 import Data.Maybe (fromMaybe)
 import Control.Monad (forM, when, join)
 import qualified Data.Map as Map
@@ -58,20 +57,24 @@ instance TestPlan (Pure Int) PlanPure where
 runPlanImplE :: PlanImpl (Event Impl b) -> IO (IntMap b)
 runPlanImplE (PlanImpl x) = do
   (e,s) <- runStateT x mempty
-  readOcc <- subscribeEvent e
-  catMaybes
+  (readOcc, unsubscribe') <- subscribeEvent e
+  res <- catMaybes
     <$> traverse (\occs -> do
-                             performGC
+                             -- performGC
                              runFrame occs readOcc)
         (makeDense s)
+  unsubscribe unsubscribe'
+  pure res
 -- TODO: commonalities between runPlanImpl*
 runPlanImplB :: PlanImpl (Behavior Impl b) -> IO (IntMap b)
 runPlanImplB (PlanImpl x) = do
   (b,s) <- runStateT x mempty
-  traverse (\occs -> do
-               performGC
+  res <- traverse (\occs -> do
+               -- performGC
                runFrame occs (readBehavior b))
     (makeDense s)
+  pure res
+
 
 runPure :: PlanPure a -> (a, IntSet)
 runPure (PlanPure p) = runStateT p mempty 0
@@ -116,17 +119,19 @@ testE name test = (name, TestE test)
 testB :: (Eq a, Show a) => String -> TestB a -> (String, TestCase)
 testB name test = (name, TestB test)
 
-
 testAgreement :: TestCase -> IO Bool
-testAgreement = \case
-  TestE p -> do
-    impl <- runPlanImplE p
-    let results = [("impl", impl)]
-    compareResult results (testEvent $ runPure p)
-  TestB p -> do
-    impl <- runPlanImplB p
-    let results = [("impl", impl)]
-    compareResult results (testBehavior $ runPure p)
+testAgreement tc = do
+  res <- case tc of
+    TestE p -> do
+      impl <- runPlanImplE p
+      let results = [("impl", impl)]
+      compareResult results (testEvent $ runPure p)
+    TestB p -> do
+      impl <- runPlanImplB p
+      let results = [("impl", impl)]
+      compareResult results (testBehavior $ runPure p)
+  pure res
+
 
 compareResult :: (Show a, Eq a) => [(String, IntMap a)] -> IntMap a -> IO Bool
 compareResult results expected = fmap and $ forM results $ \(name, r) -> do
@@ -144,11 +149,15 @@ runTests cases = do
               then ExitSuccess
               else ExitFailure 1
 
+testCase :: String -> [(String, TestCase)]
+testCase sel = maybe mempty (Map.toList . Map.singleton sel) . Map.lookup sel . Map.fromList $ testCases
+
 testCases :: [(String, TestCase)]
 testCases =
   [ testB "hold-0"  $ liftPlan . hold "0" =<< events1
   , testB "count" $ do
-      b <- liftPlan . count =<< events2
+      e <- events2
+      b <- liftPlan $ mfix $ \x -> hold 0 . mapMoment (\_ -> succ <$> sample x) $ e
       pure $ (+ (0::Int)) <$> b
   , testB "behavior-0" $ liftA2 (<>) <$> behavior1 <*> behavior2
   , testB "behavior-1" $ do
